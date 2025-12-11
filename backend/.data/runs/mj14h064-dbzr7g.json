@@ -1,0 +1,28 @@
+{
+  "id": "mj14h064-dbzr7g",
+  "repoPathOnHost": "/mnt/c/Users/Oscar/Desktop/infinitysnap/samples/testrepo",
+  "command": "node index.js",
+  "createdAt": "2025-12-11T07:34:12.508Z",
+  "status": "finished",
+  "finishedAt": "2025-12-11T07:34:12.621Z",
+  "runResult": {
+    "ok": true,
+    "stdout": "Hello Snap\n",
+    "stderr": "",
+    "code": 0,
+    "command": "node index.js",
+    "durationMs": 48
+  },
+  "analysis": {
+    "errorDetected": false,
+    "stackDetected": false,
+    "errors": [],
+    "warnings": [],
+    "stack": [],
+    "summary": "No explicit error lines detected; inspect warnings. Primary: No primary error found (only logs & warnings).",
+    "confidence": 50,
+    "primaryErrorKind": "unknown",
+    "languageGuess": "unknown"
+  },
+  "artifactsDir": "/mnt/c/Users/Oscar/Desktop/infinitysnap/backend/.data/artifacts/mj14h064-dbzr7g"
+}

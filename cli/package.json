@@ -1,0 +1,35 @@
+{
+  "name": "infinitysnap-cli",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "infinitysnap": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "boxen": "^8.0.1",
+    "chalk": "^5.6.2",
+    "chalk-animation": "^2.0.3",
+    "cli-progress": "^3.12.0",
+    "commander": "^11.0.0",
+    "diff": "^8.0.2",
+    "dotenv": "^16.0.3",
+    "execa": "^9.6.1",
+    "figlet": "^1.9.4",
+    "gradient-string": "^3.0.0",
+    "inquirer": "^13.0.2",
+    "ora": "^9.0.0",
+    "sharp": "^0.34.5",
+    "terminal-image": "^4.1.0",
+    "yargs": "^18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.1.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.1.3"
+  }
+}

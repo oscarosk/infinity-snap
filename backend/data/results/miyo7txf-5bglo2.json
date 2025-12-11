@@ -1,0 +1,42 @@
+{
+  "id": "miyo7txf-5bglo2",
+  "repoPathOnHost": "C:\\Users\\Oscar\\Desktop\\infinitysnap\\samples\\testrepo",
+  "command": "node index.js",
+  "createdAt": "2025-12-09T14:23:38.307Z",
+  "status": "failed",
+  "finishedAt": "2025-12-09T14:23:38.381Z",
+  "runResult": {
+    "ok": false,
+    "error": "Command failed: cd \"C:\\Users\\Oscar\\AppData\\Local\\Temp\\snap-qQzlvK\\repo\" && node index.js\nC:\\Users\\Oscar\\AppData\\Local\\Temp\\snap-qQzlvK\\repo\\index.js:2\r\nthrow new Error(\"demo crash\");\r\n^\r\n\r\nError: demo crash\r\n    at Object.<anonymous> (C:\\Users\\Oscar\\AppData\\Local\\Temp\\snap-qQzlvK\\repo\\index.js:2:7)\r\n    at Module._compile (node:internal/modules/cjs/loader:1730:14)\r\n    at Object..js (node:internal/modules/cjs/loader:1895:10)\r\n    at Module.load (node:internal/modules/cjs/loader:1465:32)\r\n    at Function._load (node:internal/modules/cjs/loader:1282:12)\r\n    at TracingChannel.traceSync (node:diagnostics_channel:322:14)\r\n    at wrapModuleLoad (node:internal/modules/cjs/loader:235:24)\r\n    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:171:5)\r\n    at node:internal/main/run_main_module:36:49\r\n\r\nNode.js v22.16.0\r\n",
+    "stdout": "Hello Snap\n",
+    "stderr": "C:\\Users\\Oscar\\AppData\\Local\\Temp\\snap-qQzlvK\\repo\\index.js:2\r\nthrow new Error(\"demo crash\");\r\n^\r\n\r\nError: demo crash\r\n    at Object.<anonymous> (C:\\Users\\Oscar\\AppData\\Local\\Temp\\snap-qQzlvK\\repo\\index.js:2:7)\r\n    at Module._compile (node:internal/modules/cjs/loader:1730:14)\r\n    at Object..js (node:internal/modules/cjs/loader:1895:10)\r\n    at Module.load (node:internal/modules/cjs/loader:1465:32)\r\n    at Function._load (node:internal/modules/cjs/loader:1282:12)\r\n    at TracingChannel.traceSync (node:diagnostics_channel:322:14)\r\n    at wrapModuleLoad (node:internal/modules/cjs/loader:235:24)\r\n    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:171:5)\r\n    at node:internal/main/run_main_module:36:49\r\n\r\nNode.js v22.16.0\r\n",
+    "tmpDir": "C:\\Users\\Oscar\\AppData\\Local\\Temp\\snap-qQzlvK"
+  },
+  "analysis": {
+    "errorDetected": true,
+    "stackDetected": true,
+    "errors": [
+      "Error: demo crash"
+    ],
+    "warnings": [],
+    "stack": [
+      "at Object.<anonymous> (C:\\Users\\Oscar\\AppData\\Local\\Temp\\snap-qQzlvK\\repo\\index.js:2:7)",
+      "at Module._compile (node:internal/modules/cjs/loader:1730:14)",
+      "at Object..js (node:internal/modules/cjs/loader:1895:10)",
+      "at Module.load (node:internal/modules/cjs/loader:1465:32)",
+      "at Function._load (node:internal/modules/cjs/loader:1282:12)",
+      "at TracingChannel.traceSync (node:diagnostics_channel:322:14)",
+      "at wrapModuleLoad (node:internal/modules/cjs/loader:235:24)",
+      "at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:171:5)",
+      "at node:internal/main/run_main_module:36:49"
+    ],
+    "summary": "Detected 1 error line. Stack trace depth: 9. Primary: Error: demo crash",
+    "confidence": 90
+  },
+  "suggestion": {
+    "available": true,
+    "path": "C:\\Users\\Oscar\\Desktop\\infinitysnap\\backend\\patches\\miyo7txf-5bglo2-patch.json",
+    "generatedAt": "2025-12-09T14:26:11.359Z",
+    "confidence": 0.82
+  }
+}
