@@ -1,0 +1,23 @@
+
+# --- InfinitySnap generated/runtime ---
+backend/.data/
+backend/data/
+.infinitysnap/
+**/*.trace.log
+**/timeline.json
+**/timeline.txt
+
+# --- Secrets ---
+**/.env
+**/.env.*
+!.env.example
+
+# --- Node build + deps ---
+**/node_modules/
+**/dist/
+**/.turbo/
+**/*.log
+
+# --- OS/editor ---
+.DS_Store
+Thumbs.db

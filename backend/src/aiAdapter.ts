@@ -1,162 +1,236 @@
 // backend/src/aiAdapter.ts
-
 /**
- * AI adapter for InfinitySnap:
- * - mockGeneratePatch: simple local demo patch generator
- * - generatePatch: generic patch generator hook (currently demo-only)
+ * Real patch generation adapter for InfinitySnap (OpenAI-only)
  *
- * This file no longer depends on Oumi or any external AI service.
- * In the future, generatePatch can be wired to Cline, an LLM, or any
- * external patch engine as needed.
+ * Goals:
+ * - Never hang: hard HTTP timeout (AbortController)
+ * - Fail-fast if not configured
+ * - Return deterministic JSON-only suggestions
+ *
+ * Required env:
+ *   OPENAI_API_KEY
+ *
+ * Optional:
+ *   OPENAI_PATCH_MODEL (default: gpt-5-mini)
+ *   PATCH_MAX_CONTEXT_FILES (default: 6)
+ *   PATCH_MAX_CHARS_PER_FILE (default: 12000)
+ *   PATCH_MAX_TOKENS (default: 1800)
+ *   PATCH_MAX_CANDIDATES (default: 3)
+ *   OPENAI_TIMEOUT_MS (default: 12000)
  */
 
-import fs from "fs/promises";
-import path from "path";
-
 export type PatchFile = {
-  path: string;
-  before: string;
-  after: string;
+  path: string;   // repo-relative path
+  before: string; // best-effort
+  after: string;  // required
 };
 
 export type PatchSuggestion = {
-  id?: string; // optional candidate id (used for Kestra + aggregation)
+  id?: string;
   files: PatchFile[];
   message?: string;
-  confidence?: number;
+  confidence?: number; // 0..100
   notes?: string;
   provenance?: { sourceRepos?: string[] };
 };
 
-// Explicit demo mode flag: only then we use mockGeneratePatch.
-const DEMO_MODE = process.env.INFINITYSNAP_DEMO_MODE === "true";
+function env(name: string): string {
+  return (process.env[name] || "").trim();
+}
 
-// --------------------------
-// Demo / local: mockGeneratePatch
-// --------------------------
-/**
- * mockGeneratePatch:
- * - Demo-only: only returns a suggestion if repoPath/index.js contains "throw new Error("
- * - Returns a PatchSuggestion that comments out the explicit throw.
- */
-export async function mockGeneratePatch(opts: {
+function mustEnv(name: string): string {
+  const v = env(name);
+  if (!v) throw new Error(`Missing ${name}. Patch engine is not configured.`);
+  return v;
+}
+
+function intEnv(name: string, def: number): number {
+  const n = Number(env(name));
+  if (!Number.isFinite(n) || n <= 0) return def;
+  return n;
+}
+
+/** Keep prompt small & deterministic */
+function buildPrompt(opts: {
   repoPath: string;
   primaryError: string;
-  logs?: string;
-}): Promise<PatchSuggestion | null> {
-  const { repoPath } = opts;
-  const target = path.join(repoPath, "index.js");
+  contextFiles?: { path: string; content: string }[];
+  topRepos?: string[];
+}) {
+  const maxFiles = intEnv("PATCH_MAX_CONTEXT_FILES", 6);
+  const maxCharsPerFile = intEnv("PATCH_MAX_CHARS_PER_FILE", 12000);
+
+  const ctx = (opts.contextFiles || [])
+    .slice(0, maxFiles)
+    .map((f) => ({
+      path: f.path,
+      content: (f.content || "").slice(0, maxCharsPerFile),
+    }));
+
+  const system = [
+    "You are InfinitySnap, an expert software repair agent.",
+    "Return ONLY valid JSON. No markdown. No commentary.",
+    "Propose minimal safe edits that fix the error.",
+    "Use repo-relative file paths only. Never absolute paths.",
+    'If uncertain, return {"suggestions": []}.',
+  ].join(" ");
+
+  const user = {
+    task: "Generate code patches to fix the failing project.",
+    repoPath: opts.repoPath,
+    primaryError: (opts.primaryError || "").slice(0, 2000),
+    contextFiles: ctx,
+    sourceRepos: (opts.topRepos || []).slice(0, 6),
+    outputSchema: {
+      suggestions: [
+        {
+          id: "string-optional",
+          confidence: "number-0-to-100-optional",
+          message: "string-optional",
+          notes: "string-optional",
+          provenance: { sourceRepos: ["string"] },
+          files: [{ path: "repo-relative-path", before: "string", after: "string" }],
+        },
+      ],
+    },
+  };
+
+  return { system, user };
+}
+
+/** Parse JSON safely from model output */
+function parseSuggestions(raw: string): PatchSuggestion[] {
+  let obj: any;
+  try {
+    obj = JSON.parse(raw);
+  } catch {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error("Model did not return valid JSON.");
+    obj = JSON.parse(m[0]);
+  }
+
+  const suggestions = Array.isArray(obj?.suggestions) ? obj.suggestions : [];
+
+  const cleaned: PatchSuggestion[] = [];
+  for (const s of suggestions) {
+    if (!s || !Array.isArray(s.files) || !s.files.length) continue;
+
+    const files: PatchFile[] = [];
+    for (const f of s.files) {
+      if (!f?.path || typeof f.after !== "string") continue;
+      if (typeof f.path !== "string") continue;
+
+      // repo-relative only; no traversal
+      if (f.path.startsWith("/") || f.path.includes("..")) continue;
+
+      files.push({
+        path: f.path,
+        before: typeof f.before === "string" ? f.before : "",
+        after: f.after,
+      });
+    }
+    if (!files.length) continue;
+
+    cleaned.push({
+      id: typeof s.id === "string" ? s.id : undefined,
+      confidence: typeof s.confidence === "number" ? s.confidence : undefined,
+      message: typeof s.message === "string" ? s.message : undefined,
+      notes: typeof s.notes === "string" ? s.notes : undefined,
+      provenance:
+        s.provenance && typeof s.provenance === "object"
+          ? {
+              sourceRepos: Array.isArray(s.provenance.sourceRepos)
+                ? s.provenance.sourceRepos
+                : undefined,
+            }
+          : undefined,
+      files,
+    });
+  }
+
+  return cleaned;
+}
+
+async function callOpenAI(prompt: { system: string; user: any }): Promise<string> {
+  const apiKey = mustEnv("OPENAI_API_KEY");
+  const model = (env("OPENAI_PATCH_MODEL") || "gpt-5-mini").trim();
+  const timeoutMs = intEnv("OPENAI_TIMEOUT_MS", 12_000);
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const before = await fs.readFile(target, "utf8");
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        input: [
+          { role: "system", content: prompt.system },
+          { role: "user", content: JSON.stringify(prompt.user) },
+        ],
+        max_output_tokens: intEnv("PATCH_MAX_TOKENS", 1800),
+        temperature: 0.2,
+        store: false,
+      }),
+    });
 
-    // Demo heuristic: only produce patch if explicit throw exists
-    if (!/throw new Error\(/.test(before)) return null;
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      throw new Error(`OpenAI error ${resp.status}: ${t.slice(0, 600)}`);
+    }
 
-    const after = before.replace(
-      /throw new Error\([^)]*\);?/,
-      "// InfinitySnap (demo): commented out throw"
-    );
+    const data: any = await resp.json();
 
-    const suggestion: PatchSuggestion = {
-      id: "demo-1",
-      files: [{ path: target, before, after }],
-      message: "Demo: comment out explicit throw in index.js",
-      confidence: 0.82,
-      notes:
-        "Demo patch — only applied when index.js contains an explicit `throw new Error(...)`.",
-      provenance: { sourceRepos: [] },
-    };
+    // Prefer `output_text`, fallback to scanning output blocks
+    const text =
+      data?.output_text ||
+      (Array.isArray(data?.output)
+        ? data.output
+            .flatMap((it: any) => it?.content || [])
+            .filter((c: any) => c?.type === "output_text" && typeof c?.text === "string")
+            .map((c: any) => c.text)
+            .join("\n")
+        : "");
 
-    // Simulate small latency
-    await new Promise((r) => setTimeout(r, 300));
-    return suggestion;
-  } catch {
-    // If file read fails or anything else happens, return null (no suggestion)
-    return null;
+    return String(text || "");
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      throw new Error(`OpenAI timeout after ${timeoutMs}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-// --------------------------
-// Helpers for payload safety (kept for future use)
-// --------------------------
-
-const MAX_CONTEXT_FILES = 8;
-const MAX_FILE_CONTENT_CHARS = 4000;
-
-/**
- * Clamp context files to avoid sending huge payloads to any future external engine.
- */
-function sanitizeContextFiles(
-  contextFiles: { path: string; content: string }[] = []
-) {
-  return contextFiles.slice(0, MAX_CONTEXT_FILES).map((f) => ({
-    path: f.path,
-    content:
-      f.content.length > MAX_FILE_CONTENT_CHARS
-        ? f.content.slice(0, MAX_FILE_CONTENT_CHARS) +
-          "\n/* [InfinitySnap] truncated for context */"
-        : f.content,
-  }));
-}
-
-function uniqueStrings(values: string[] = []): string[] {
-  return Array.from(new Set(values.filter(Boolean)));
-}
-
-// --------------------------
-// Main: generatePatch (no external deps)
-// --------------------------
-/**
- * generatePatch:
- * - Generic patch generator hook.
- * - Currently:
- *   - If INFINITYSNAP_DEMO_MODE=true → uses mockGeneratePatch.
- *   - Otherwise → returns null (no suggestion).
- *
- * In the future, this function can be extended to call Cline,
- * a local LLM, or any external patch engine.
- */
 export async function generatePatch(opts: {
   repoPath: string;
   primaryError: string;
-  contextFiles?: { path: string; content: string }[]; // small snippets
-  topRepos?: string[]; // optional list of related official repos (from Cline)
-}): Promise<PatchSuggestion[] | null> {
-  const { repoPath, primaryError, contextFiles = [], topRepos = [] } = opts;
+  contextFiles?: { path: string; content: string }[];
+  topRepos?: string[];
+}): Promise<PatchSuggestion[]> {
+  const prompt = buildPrompt(opts);
+  const raw = await callOpenAI(prompt);
+  const suggestions = parseSuggestions(raw);
 
-  // Currently unused, but kept to show future use for payload limiting:
-  void sanitizeContextFiles(contextFiles);
-  void uniqueStrings(topRepos);
-
-  if (!DEMO_MODE) {
-    // Real backend mode: no external patch engine wired yet.
-    return null;
-  }
-
-  const mock = await mockGeneratePatch({ repoPath, primaryError });
-  return mock ? [mock] : null;
+  const max = intEnv("PATCH_MAX_CANDIDATES", 3);
+  return suggestions.slice(0, Math.max(1, max));
 }
 
-// --------------------------
-// Backwards-compatibility exports
-// --------------------------
-
 /**
- * isOumiConfigured is kept for compatibility but always false now,
- * since we no longer integrate Oumi.
- */
-export const isOumiConfigured = false;
-
-/**
- * generatePatchWithOumi is kept as an alias for generatePatch so any
- * existing imports keep working. It no longer talks to Oumi.
+ * Backwards compatibility alias.
+ * routes.ts already imports this name.
  */
 export async function generatePatchWithOumi(opts: {
   repoPath: string;
   primaryError: string;
   contextFiles?: { path: string; content: string }[];
   topRepos?: string[];
-}): Promise<PatchSuggestion[] | null> {
+}): Promise<PatchSuggestion[]> {
   return generatePatch(opts);
 }

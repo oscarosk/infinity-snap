@@ -5,6 +5,7 @@ import fs from "fs/promises";
 import path from "path";
 
 import { makeTempDir } from "./util";
+import { trace } from "./logger";
 
 const exec = util.promisify(_exec);
 
@@ -14,78 +15,71 @@ export type RunResult = {
   stderr?: string;
   code?: number | null;
   error?: string;
-  tmpDir?: string;      // path to sandbox (kept for debugging) — removed if cleanup true
-  command?: string;     // the command that was executed
-  durationMs?: number;  // how long the run took in ms
+
+  tmpDir?: string;
+  command?: string;
+
+  durationMs?: number;
+  copyMs?: number;
+  execMs?: number;
+
+  mode?: "direct" | "sandbox";
 };
 
 export type SandboxOptions = {
-  repoPathOnHost: string; // absolute or relative path to repo folder
-  command: string;        // shell command to run inside sandbox (e.g. "npm test" or "node index.js")
+  repoPathOnHost: string;
+  command: string;
   timeoutMs?: number;
-  cleanup?: boolean;      // if true, delete sandbox after run (default: false)
-  dockerImage?: string;   // if provided, run inside docker using mounted folder
+  cleanup?: boolean;
+  dockerImage?: string;
+
+  // NEW
+  mode?: "direct" | "sandbox";
+  traceFile?: string;
 };
 
-const MAX_BUFFER = 1024 * 1024 * 50; // 50MB
+const MAX_BUFFER = 1024 * 1024 * 50;
 
-/**
- * Copy directory recursively.
- * Prefer fs.cp when available (Node 16.7+). Fallback to robocopy/xcopy or cp -a.
- */
-async function copyRecursive(src: string, dest: string): Promise<void> {
-  // prefer fs.cp if available at runtime
-  // (TypeScript may not have the type, so use any)
-  // @ts-ignore
-  if (typeof (fs as any).cp === "function") {
-    // @ts-ignore
-    await (fs as any).cp(src, dest, { recursive: true, force: true });
-    return;
-  }
+function normalizeTimeoutMs(timeoutMs?: number) {
+  const n = Number(timeoutMs);
+  if (!Number.isFinite(n) || n <= 0) return 60_000;
+  return Math.max(1_000, n);
+}
 
-  const platform = process.platform;
-  await fs.mkdir(dest, { recursive: true });
+async function copyRepoWithExcludes(srcAbs: string, destAbs: string) {
+  await fs.mkdir(destAbs, { recursive: true });
 
-  if (platform === "win32") {
-    // prefer robocopy, fallback silently to xcopy (xcopy may not exist on modern Win)
-    try {
-      // Note: robocopy returns non-zero exit codes on some successes; we ignore exit code here
-      await exec(
-        `robocopy "${src}" "${dest}" /E /NFL /NDL /NJH /NJS /MT:8`,
-        { windowsHide: true, maxBuffer: MAX_BUFFER }
-      );
-      return;
-    } catch {
-      // fallback to xcopy
-      await exec(
-        `xcopy "${src}" "${dest}" /E /I /Y`,
-        { windowsHide: true, maxBuffer: MAX_BUFFER }
-      );
-      return;
-    }
-  } else {
-    // POSIX
-    await exec(`cp -a "${src}/." "${dest}/"`, {
-      shell: "/bin/bash",
-      maxBuffer: MAX_BUFFER,
-    });
-    return;
-  }
+  const excludes = [
+    ".git",
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+    "coverage",
+    ".cache",
+    ".turbo",
+    ".vercel",
+    ".DS_Store",
+    "backend/.data",
+  ];
+
+  // tar-pipe copy is fast on WSL/Linux/macOS
+  const exFlags = excludes.map((e) => `--exclude='${e}'`).join(" ");
+  const cmd = `bash -lc "cd '${srcAbs.replace(/'/g, "'\\''")}' && tar -cf - ${exFlags} . | (cd '${destAbs.replace(/'/g, "'\\''")}' && tar -xf -)"`;
+  await exec(cmd, { maxBuffer: MAX_BUFFER });
 }
 
 /**
- * runInSandbox: copies repo into a temp folder and runs a command.
- * - If dockerImage is provided, runs the command in that docker image with the sandbox mounted at /work.
- * - WARNING: This executes arbitrary project code; never expose directly to untrusted users.
+ * runInSandbox supports:
+ * - mode=direct (default): run command in repoPathOnHost directly (FAST)
+ * - mode=sandbox: copy repo into temp dir (with excludes) and run there (SAFE)
  */
 export async function runInSandbox(opts: SandboxOptions): Promise<RunResult> {
-  const {
-    repoPathOnHost,
-    command,
-    timeoutMs,
-    cleanup = false,
-    dockerImage,
-  } = opts;
+  const mode = (opts.mode || "direct") as "direct" | "sandbox";
+  const timeoutMs = normalizeTimeoutMs(opts.timeoutMs);
+  const { repoPathOnHost, command, cleanup = true, dockerImage, traceFile } = opts;
+
+  await trace(traceFile, "sandbox.enter", { repoPathOnHost, command, timeoutMs, mode });
 
   if (!repoPathOnHost || !command) {
     return { ok: false, error: "repoPathOnHost and command are required" };
@@ -93,122 +87,149 @@ export async function runInSandbox(opts: SandboxOptions): Promise<RunResult> {
 
   const absSrc = path.resolve(repoPathOnHost);
 
+  await trace(traceFile, "sandbox.stat.start", { absSrc });
   try {
     const st = await fs.stat(absSrc);
-    if (!st.isDirectory()) {
-      return {
-        ok: false,
-        error: `Source path is not a directory: ${absSrc}`,
-      };
-    }
-  } catch (e: any) {
-    return {
-      ok: false,
-      error: `Source path does not exist: ${absSrc}`,
-    };
+    if (!st.isDirectory()) return { ok: false, error: `Source path is not a directory: ${absSrc}` };
+  } catch {
+    return { ok: false, error: `Source path does not exist: ${absSrc}` };
   }
+  await trace(traceFile, "sandbox.stat.ok", { absSrc });
 
-  const tmpDir = await makeTempDir("snap");
-  const dest = path.join(tmpDir, "repo");
+  const t0 = Date.now();
 
-  try {
-    await copyRecursive(absSrc, dest);
-  } catch (e: any) {
-    const msg = e?.message || e;
-    if (!cleanup) {
-      return {
-        ok: false,
-        error: `Failed to copy repo: ${msg}`,
-        tmpDir,
-        command,
-      };
-    }
-    // attempt cleanup and return
+  // ======================================================
+  // DIRECT MODE (FAST)
+  // ======================================================
+  if (mode === "direct") {
+    const e0 = Date.now();
+    await trace(traceFile, "sandbox.exec.start", { cwd: absSrc, command });
+
     try {
-      await fs.rm(tmpDir, { recursive: true, force: true });
-    } catch {
-      // ignore cleanup failure
-    }
-    return {
-      ok: false,
-      error: `Failed to copy repo: ${msg}`,
-      command,
-    };
-  }
-
-  const start = Date.now();
-
-  const finish = async (result: RunResult): Promise<RunResult> => {
-    const durationMs = Date.now() - start;
-    result.durationMs = durationMs;
-    if (cleanup) {
-      try {
-        await fs.rm(tmpDir, { recursive: true, force: true });
-        result.tmpDir = undefined;
-      } catch {
-        // ignore cleanup failure
-      }
-    } else {
-      result.tmpDir = tmpDir;
-    }
-    return result;
-  };
-
-  try {
-    if (dockerImage) {
-      // escape double quotes inside command to place inside sh -c "..."
-      const safeCmd = command.replace(/"/g, '\\"');
-      const dockerCmd = `docker run --rm -v "${dest}:/work" -w /work ${dockerImage} sh -lc "${safeCmd}"`;
-
-      const { stdout, stderr } = await exec(dockerCmd, {
-        timeout: timeoutMs ?? 0,
+      const { stdout, stderr } = await exec(command, {
+        cwd: absSrc,
         maxBuffer: MAX_BUFFER,
-      });
+        timeout: Math.max(5_000, timeoutMs),
+        killSignal: "SIGKILL",
+      } as any);
 
-      return await finish({
+      const execMs = Date.now() - e0;
+      await trace(traceFile, "sandbox.exec.ok", { execMs });
+
+      return {
         ok: true,
         stdout: stdout?.toString(),
         stderr: stderr?.toString(),
         code: 0,
         command,
+        durationMs: Date.now() - t0,
+        copyMs: 0,
+        execMs,
+        mode: "direct",
+      };
+    } catch (e: any) {
+      const err = e as ExecException & { stdout?: string | Buffer; stderr?: string | Buffer };
+      const execMs = Date.now() - e0;
+
+      await trace(traceFile, "sandbox.exec.fail", {
+        execMs,
+        message: err?.message || String(err),
+        code: typeof err?.code === "number" ? err.code : null,
       });
+
+      return {
+        ok: false,
+        error: err?.message ?? "Command failed",
+        stdout: err?.stdout != null ? err.stdout.toString() : undefined,
+        stderr: err?.stderr != null ? err.stderr.toString() : undefined,
+        code: typeof err?.code === "number" ? err.code : null,
+        command,
+        durationMs: Date.now() - t0,
+        copyMs: 0,
+        execMs,
+        mode: "direct",
+      };
+    }
+  }
+
+  // ======================================================
+  // SANDBOX MODE (SAFE)
+  // ======================================================
+  const tmpDir = await makeTempDir("snap");
+  const destRepo = path.join(tmpDir, "repo");
+
+  let copyMs = 0;
+  let execMs = 0;
+
+  const finish = async (result: RunResult): Promise<RunResult> => {
+    result.durationMs = Date.now() - t0;
+    result.copyMs = copyMs;
+    result.execMs = execMs;
+    result.mode = "sandbox";
+
+    if (cleanup) {
+      try {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      } catch {}
+      result.tmpDir = undefined;
+    } else {
+      result.tmpDir = tmpDir;
     }
 
-    // Non-docker: run command inside dest using shell.
-    // WARNING: this runs arbitrary shell commands.
-    const fullCmd = `cd "${dest}" && ${command}`;
-    const { stdout, stderr } = await exec(fullCmd, {
-      timeout: timeoutMs ?? 0,
-      maxBuffer: MAX_BUFFER,
-    });
+    return result;
+  };
 
-    return await finish({
-      ok: true,
-      stdout: stdout?.toString(),
-      stderr: stderr?.toString(),
-      code: 0,
-      command,
-    });
+  try {
+    const c0 = Date.now();
+    await trace(traceFile, "sandbox.copy.start", { from: absSrc, to: destRepo });
+    await copyRepoWithExcludes(absSrc, destRepo);
+    copyMs = Date.now() - c0;
+    await trace(traceFile, "sandbox.copy.ok", { copyMs });
   } catch (e: any) {
-    const err = e as ExecException & {
-      stdout?: string | Buffer;
-      stderr?: string | Buffer;
+    await trace(traceFile, "sandbox.copy.fail", { message: e?.message || String(e) });
+    return finish({ ok: false, error: `Failed to copy repo: ${e?.message || String(e)}`, command, code: null });
+  }
+
+  try {
+    const e0 = Date.now();
+    await trace(traceFile, "sandbox.exec.start", { cwd: destRepo, command });
+
+    const execOpts: any = {
+      maxBuffer: MAX_BUFFER,
+      timeout: Math.max(5_000, timeoutMs),
+      killSignal: "SIGKILL",
     };
 
-    const code =
-      typeof err?.code === "number" ? err.code : null;
+    if (dockerImage) {
+      const safeCmd = command.replace(/"/g, '\\"');
+      const dockerCmd = `docker run --rm -v "${destRepo}:/work" -w /work ${dockerImage} sh -lc "${safeCmd}"`;
+      const { stdout, stderr } = await exec(dockerCmd, execOpts);
+      execMs = Date.now() - e0;
+      await trace(traceFile, "sandbox.exec.ok", { execMs });
 
-    const stdout =
-      err?.stdout != null ? err.stdout.toString() : undefined;
-    const stderr =
-      err?.stderr != null ? err.stderr.toString() : undefined;
+      return finish({ ok: true, stdout: stdout?.toString(), stderr: stderr?.toString(), code: 0, command });
+    }
 
-    return await finish({
+    const { stdout, stderr } = await exec(command, { ...execOpts, cwd: destRepo });
+    execMs = Date.now() - e0;
+    await trace(traceFile, "sandbox.exec.ok", { execMs });
+
+    return finish({ ok: true, stdout: stdout?.toString(), stderr: stderr?.toString(), code: 0, command });
+  } catch (e: any) {
+    const err = e as ExecException & { stdout?: string | Buffer; stderr?: string | Buffer };
+    execMs = execMs || 0;
+
+    await trace(traceFile, "sandbox.exec.fail", {
+      message: err?.message || String(err),
+      code: typeof err?.code === "number" ? err.code : null,
+    });
+
+    return finish({
       ok: false,
       error: err?.message ?? "Command failed",
-      stdout,
-      stderr,
-      code,
+      stdout: err?.stdout != null ? err.stdout.toString() : undefined,
+      stderr: err?.stderr != null ? err.stderr.toString() : undefined,
+      code: typeof err?.code === "number" ? err.code : null,
       command,
     });
   }

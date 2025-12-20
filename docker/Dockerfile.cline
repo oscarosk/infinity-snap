@@ -1,0 +1,9 @@
+FROM node:20-bookworm
+RUN apt-get update && apt-get install -y \
+  python3 make g++ git ca-certificates sqlite3 \
+  && rm -rf /var/lib/apt/lists/*
+# Install Cline under Node 20
+RUN npm i -g cline
+# Rebuild native deps (sqlite bindings etc.) if any exist
+RUN npm explore -g cline -- npm rebuild --build-from-source || true
+WORKDIR /workspace

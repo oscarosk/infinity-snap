@@ -2,106 +2,306 @@
 import express from "express";
 import path from "path";
 import fs from "fs/promises";
-import axios from "axios";
+import { performance } from "perf_hooks";
+import { spawn } from "node:child_process";
 
 import { runInSandbox, RunResult } from "./sandboxRunner";
+import { analyzeFromStdoutStderr, Analysis } from "./analyzer";
+import { Timeline } from "./timeline";
+import { trace } from "./logger";
+
 import {
-  analyzeLogs,
-  analyzeFromStdoutStderr,
-  Analysis,
-} from "./analyzer";
-import {
-  generatePatchWithOumi,
-  PatchSuggestion,
-  PatchFile,
-} from "./aiAdapter";
-import {
-  clineSearchDocs,
-  clineFetchExample,
-} from "./clineClient";
+  initStore,
+  saveRun,
+  readRun,
+  appendStep,
+  writeLog,
+  writeMetrics,
+  listRuns,
+  runFilePath,
+  metricsFilePath,
+  patchFilePath,
+  diffFilePath,
+  artifactsDirFor,
+  timelineFilePath,
+  timelineJsonPath,
+  timelineJsonPath as _timelineJsonPath, // (kept for compat)
+} from "./runStore";
+
+import { generateRunId, PATCHES_DIR } from "./util";
+import { verifyRun } from "./verifier";
+import { checkCommand, clampLog } from "./policy";
+
+import type { RunStatus, RunStepEntry, RunRecord } from "./types";
 
 const router = express.Router();
 
-// --------------------------
-// Helpers / constants
-// --------------------------
-
-// Base data directory for all runtime files
-const DATA_DIR = path.join(__dirname, "..", ".data");
-
-// Subfolders for different kinds of artifacts
-const RESULTS_DIR = path.join(DATA_DIR, "runs");        // backend/.data/runs
-const PATCHES_DIR = path.join(DATA_DIR, "patches");     // backend/.data/patches
-const ARTIFACTS_DIR =
-  process.env.ARTIFACTS_DIR || path.join(DATA_DIR, "artifacts"); // backend/.data/artifacts
-
-async function ensureDirs() {
-  await fs.mkdir(DATA_DIR, { recursive: true }).catch(() => {});
-  await fs.mkdir(RESULTS_DIR, { recursive: true }).catch(() => {});
-  await fs.mkdir(PATCHES_DIR, { recursive: true }).catch(() => {});
-  await fs.mkdir(ARTIFACTS_DIR, { recursive: true }).catch(() => {});
-}
-ensureDirs();
-
-function makeRunId() {
-  // simple unique id — timestamp (base36) + random suffix
-  return `${Date.now().toString(36)}-${Math.random()
-    .toString(36)
-    .slice(2, 8)}`;
+// -----------------------------
+// Auth middleware (optional)
+// -----------------------------
+function requireApiKey(req: any, res: any, next: any) {
+  const key = (process.env.BACKEND_API_KEY || "").trim();
+  if (!key) return next();
+  const got = (req.headers["x-api-key"] || "").toString().trim();
+  if (got !== key) {
+    return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+  }
+  next();
 }
 
-async function saveRun(runId: string, payload: any) {
-  const file = path.join(RESULTS_DIR, `${runId}.json`);
-  await fs.writeFile(file, JSON.stringify(payload, null, 2), "utf8");
-  return file;
+// Ensure store dirs exist
+const READY = initStore();
+async function ensureReady() {
+  await READY;
 }
 
-async function readRun(runId: string) {
-  const file = path.join(RESULTS_DIR, `${runId}.json`);
-  const raw = await fs.readFile(file, "utf8");
-  return JSON.parse(raw);
+// Strict runId
+const RUN_ID_RE = /^[a-z0-9]+-[a-z0-9]+$/i;
+function assertValidRunId(runId: string) {
+  if (!RUN_ID_RE.test(runId)) throw new Error("invalid runId");
 }
 
-async function savePatch(
-  runId: string,
-  suggestion: PatchSuggestion | PatchSuggestion[]
-) {
-  const file = path.join(PATCHES_DIR, `${runId}-patch.json`);
-  await fs.writeFile(file, JSON.stringify(suggestion, null, 2), "utf8");
-  return file;
+function safeSendJson(res: any, status: number, body: any) {
+  if (res.headersSent) return;
+  try {
+    res.status(status).json(body);
+  } catch {
+    // ignore
+  }
 }
 
-// --------------------------
+/**
+ * Abort latch:
+ * - req "aborted" fires on client abort
+ * - res "close" fires always; treat as abort only if response not finished
+ */
+function createAbortLatch(req: any, res: any) {
+  let aborted = false;
+
+  req.on("aborted", () => {
+    aborted = true;
+  });
+
+  res.on("close", () => {
+    if (!res.writableEnded) aborted = true;
+  });
+
+  return () => aborted;
+}
+
+async function withHardTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  onTimeout?: () => Promise<void> | void
+): Promise<T> {
+  let t: NodeJS.Timeout | null = null;
+
+  const timeout = new Promise<T>((_, reject) => {
+    t = setTimeout(async () => {
+      try {
+        await onTimeout?.();
+      } catch {}
+      reject(new Error(`timeout_after_${ms}ms`));
+    }, ms);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
+// ============================================================
 // Health
-// --------------------------
-router.get("/health", (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+// ============================================================
+router.get("/health", async (_req, res) => {
+  await ensureReady();
+  res.json({ ok: true, ts: Date.now(), service: "InfinitySnap backend" });
 });
 
-// --------------------------
-// POST /snap
-// --------------------------
-router.post("/snap", async (req, res) => {
+// ============================================================
+// Runs list
+// ============================================================
+router.get("/runs", async (_req, res) => {
   try {
+    await ensureReady();
+    const runs = await listRuns();
+    res.json({ ok: true, runs });
+  } catch (e: any) {
+    console.error("runs list error:", e);
+    res.status(500).json({
+      ok: false,
+      error: "INTERNAL_ERROR",
+      message: e?.message || String(e),
+    });
+  }
+});
+
+// Alias
+router.get("/results", async (_req, res) => {
+  try {
+    await ensureReady();
+    const runs = await listRuns();
+    res.json({ ok: true, runs });
+  } catch (e: any) {
+    console.error("results alias error:", e);
+    res.status(500).json({
+      ok: false,
+      error: "INTERNAL_ERROR",
+      message: e?.message || String(e),
+    });
+  }
+});
+
+// ============================================================
+// Run detail
+// ============================================================
+router.get("/runs/:id", async (req, res) => {
+  try {
+    await ensureReady();
+    const runId = String(req.params.id || "");
+    assertValidRunId(runId);
+    const data = await readRun(runId);
+    res.json({ ok: true, runId, data });
+  } catch {
+    res
+      .status(404)
+      .json({ ok: false, error: "NOT_FOUND", message: "run not found" });
+  }
+});
+
+// ============================================================
+// Logs / Diff / Patch (so CLI/dashboard don’t 404)
+// ============================================================
+router.get("/runs/:id/logs", async (req, res) => {
+  try {
+    await ensureReady();
+    const runId = String(req.params.id || "");
+    assertValidRunId(runId);
+
+    const run = await readRun(runId);
+    const logName = String(req.query?.name || "").trim();
+
+    // if ?name=sandbox.stdout return that file content
+    if (logName) {
+      const p = run?.logPaths?.[logName];
+      if (!p) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      const txt = await fs.readFile(p, "utf-8");
+      return res.type("text/plain").send(txt);
+    }
+
+    // else return map
+    return res.json({ ok: true, runId, logPaths: run?.logPaths || {} });
+  } catch {
+    return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  }
+});
+
+router.get("/runs/:id/diff", async (req, res) => {
+  try {
+    await ensureReady();
+    const runId = String(req.params.id || "");
+    assertValidRunId(runId);
+    const txt = await fs.readFile(diffFilePath(runId), "utf-8");
+    return res.type("text/plain").send(txt);
+  } catch {
+    return res.status(404).type("text/plain").send("");
+  }
+});
+
+router.get("/runs/:id/patch", async (req, res) => {
+  try {
+    await ensureReady();
+    const runId = String(req.params.id || "");
+    assertValidRunId(runId);
+    const txt = await fs.readFile(patchFilePath(runId), "utf-8");
+    return res.type("application/json").send(txt);
+  } catch {
+    return res.status(404).type("application/json").send("[]");
+  }
+});
+
+// ============================================================
+// Timeline
+// ============================================================
+router.get("/runs/:id/timeline", async (req, res) => {
+  try {
+    await ensureReady();
+    const runId = String(req.params.id || "");
+    assertValidRunId(runId);
+    const txt = await Timeline.readTxt(timelineFilePath(runId));
+    res.type("text/plain").send(txt);
+  } catch {
+    res.status(404).type("text/plain").send("No timeline for this run yet.");
+  }
+});
+
+router.get("/runs/:id/timeline.json", async (req, res) => {
+  try {
+    await ensureReady();
+    const runId = String(req.params.id || "");
+    assertValidRunId(runId);
+    const json = await fs.readFile(timelineJsonPath(runId), "utf-8");
+    res.json(JSON.parse(json));
+  } catch {
+    res.status(404).type("text/plain").send("No timeline json for this run yet.");
+  }
+});
+
+// ============================================================
+// POST /runs/start  (Alias: POST /snap)
+// ============================================================
+async function handleRunsStart(req: any, res: any) {
+  let runId: string | null = null;
+  let timeline: Timeline | null = null;
+  let timelineFlushed = false;
+  let traceFile: string | null = null;
+
+  const isAborted = createAbortLatch(req, res);
+
+  try {
+    await ensureReady();
+    const wallT0 = Date.now();
+
     const rawPath: string | undefined =
       req.body?.repoPathOnHost ||
       req.body?.repoHostPath ||
-      req.body?.path;
+      req.body?.path ||
+      req.body?.repoPath;
+
     const command: string | undefined = req.body?.command;
-    const timeoutMs: number | undefined = req.body?.timeoutMs;
+
+    const timeoutMsRaw: number | undefined = req.body?.timeoutMs;
+    const timeoutMs: number = Number.isFinite(Number(timeoutMsRaw))
+      ? Math.max(1_000, Number(timeoutMsRaw))
+      : 60_000;
+
     const cleanup: boolean =
       req.body?.cleanup === undefined ? true : !!req.body?.cleanup;
+
     const dockerImage: string | undefined = req.body?.dockerImage;
 
     if (!rawPath || !command) {
-      return res.status(400).json({
+      return safeSendJson(res, 400, {
         ok: false,
-        error:
-          "Require repoPathOnHost (or repoHostPath/path) and command.",
+        error: "BAD_REQUEST",
+        message:
+          "Require repoPathOnHost (or repoHostPath/path/repoPath) and command.",
       });
     }
 
-    // Resolve candidate absolute paths
+    // POLICY: validate command
+    const cmdDecision = checkCommand(command);
+    if (!cmdDecision.ok) {
+      return safeSendJson(res, 400, {
+        ok: false,
+        error: cmdDecision.code,
+        message: cmdDecision.reason,
+      });
+    }
+
+    // Resolve repo path robustly
     const candidates = [
       path.resolve(rawPath),
       path.resolve(process.cwd(), rawPath),
@@ -110,6 +310,7 @@ router.post("/snap", async (req, res) => {
 
     let absSrc: string | null = null;
     let lastErr: any = null;
+
     for (const c of candidates) {
       try {
         await fs.access(c);
@@ -121,597 +322,510 @@ router.post("/snap", async (req, res) => {
     }
 
     if (!absSrc) {
-      return res.status(400).json({
+      return safeSendJson(res, 400, {
         ok: false,
-        error: `Source path not found. Tried:\n${candidates.join(
+        error: "SOURCE_NOT_FOUND",
+        message: `Source path not found. Tried:\n${candidates.join(
           "\n"
         )}\nLast error: ${lastErr?.message || lastErr}`,
       });
     }
 
-    // create run id and early metadata
-    const runId = makeRunId();
-    const runMeta: any = {
-      id: runId,
-      repoPathOnHost: absSrc,
-      command,
-      createdAt: new Date().toISOString(),
-      status: "running",
-    };
+    runId = generateRunId();
+    traceFile = path.join(artifactsDirFor(runId), "snap.trace.log");
 
-    // persist early
-    await saveRun(runId, runMeta);
-
-    // perform the sandbox run
-    const runResult: RunResult = await runInSandbox({
-      repoPathOnHost: absSrc,
+    await trace(traceFile, "snap.start", {
+      runId,
+      rawPath,
+      absSrc,
       command,
       timeoutMs,
       cleanup,
-      dockerImage,
+      dockerImage: dockerImage ?? null,
     });
 
-    // analysis – use improved analyzer
-    const analysis: Analysis = analyzeFromStdoutStderr(
-      runResult.stdout || "",
-      runResult.stderr || ""
-    );
+    // Runner mode:
+    // Default = DIRECT (fast)
+    // Set INFINITYSNAP_SAFE_MODE=1 to force SANDBOX
+    const safeMode = String(process.env.INFINITYSNAP_SAFE_MODE || "").trim() === "1";
+    const mode = safeMode ? "sandbox" : "direct";
 
-    // finalize run record
-    const finalRecord = {
-      ...runMeta,
-      finishedAt: new Date().toISOString(),
-      status: (runResult as any).ok ? "finished" : "failed",
-      runResult,
-      analysis,
-      artifactsDir: path.join(ARTIFACTS_DIR, runId),
+    timeline = new Timeline(timelineFilePath(runId));
+    timeline.start("run.init", "initializing", { repoPath: absSrc, command, mode });
+
+    const runRecord: RunRecord = {
+      runId,
+      repoPath: absSrc,
+      command,
+      status: "running" as RunStatus,
+      createdAt: new Date().toISOString(),
+      finishedAt: null,
+      lastUpdatedAt: new Date().toISOString(),
+      steps: [] as RunStepEntry[],
+      logPaths: {},
+      diffPath: null,
+      confidence: { score: null, reasons: [] } as any,
+      metricsPath: metricsFilePath(runId),
+      patchPath: null,
+      artifactsDir: artifactsDirFor(runId),
     };
 
-    // ensure artifacts dir exists and save logs
-    await fs
-      .mkdir(finalRecord.artifactsDir, { recursive: true })
-      .catch(() => {});
-    await fs.writeFile(
-      path.join(finalRecord.artifactsDir, "stdout.txt"),
-      runResult.stdout || "",
-      "utf8"
-    );
-    await fs.writeFile(
-      path.join(finalRecord.artifactsDir, "stderr.txt"),
-      runResult.stderr || "",
-      "utf8"
-    );
+    await saveRun(runRecord);
 
-    await saveRun(runId, finalRecord);
-
-    // return runId for followups
-    return res.json({
-      ok: true,
-      runId,
-      runResult,
-      analysis,
-      saved: path.join("backend", ".data", "runs", `${runId}.json`),
+    await appendStep(runId, {
+      type: "run.start",
+      message: "Run initialized",
+      ts: Date.now(),
+      meta: { repoPath: absSrc, command, dockerImage: dockerImage || null, mode },
     });
-  } catch (e: any) {
-    console.error("Snap Error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
-  }
-});
 
-// --------------------------
-// POST /analyze
-// --------------------------
-router.post("/analyze", async (req, res) => {
-  try {
-    const logs: string = req.body?.logs;
-    if (!logs)
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing logs" });
-
-    const analysis = analyzeLogs(logs);
-    return res.json({ ok: true, analysis });
-  } catch (e: any) {
-    console.error("Analyzer Error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// --------------------------
-// POST /generate
-//   Cline -> Oumi -> save suggestions -> start Kestra
-// --------------------------
-router.post("/generate", async (req, res) => {
-  try {
-    const runId = req.body?.runId;
-    if (!runId)
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing runId" });
-
-    // load run
-    const run = await readRun(runId).catch(() => null);
-    if (!run)
-      return res
-        .status(404)
-        .json({ ok: false, error: "run not found" });
-
-    const primary: string =
-      run.analysis?.summary ||
-      (run.runResult?.stderr || run.runResult?.stdout || "").slice(
-        0,
-        800
-      );
-
-    // 1) Query Cline to discover related repos / docs using the primary text
-    let topRepos: string[] = [];
-    try {
-      const keywords = (primary || "")
-        .replace(/\s+/g, " ")
-        .slice(0, 400);
-      topRepos = await clineSearchDocs(keywords);
-      topRepos = Array.isArray(topRepos) ? topRepos.slice(0, 6) : [];
-    } catch (e: any) {
-      console.warn("clineSearchDocs failed:", e?.message || e);
+    // If client aborted before we began
+    if (isAborted()) {
+      await trace(traceFile, "snap.aborted_before_run", { runId });
+      runRecord.status = "aborted" as any;
+      runRecord.finishedAt = new Date().toISOString();
+      runRecord.lastUpdatedAt = new Date().toISOString();
+      await saveRun(runRecord);
+      try {
+        timeline.fail("run.aborted", "client_disconnected");
+        await timeline.flush();
+      } catch {}
+      return;
     }
 
-    // 2) Fetch a few example files/snippets from top repos
-    const snippets: { path: string; content: string }[] = [];
-    for (const r of (topRepos || []).slice(0, 3)) {
-      try {
-        const files = await clineFetchExample(r);
-        for (const f of (files || []).slice(0, 3)) {
-          snippets.push({
-            path: f.path || "unknown",
-            content: (f.content || "").slice(0, 50_000),
+    // Hard timeout so API returns cleanly
+    const hardMs = Math.max(70_000, timeoutMs + 10_000);
+
+    timeline.start("sandbox.run", command, {
+      timeoutMs,
+      cleanup,
+      dockerImage: dockerImage ?? null,
+      mode,
+    });
+
+    const sb0 = performance.now();
+    await trace(traceFile, "snap.before_runInSandbox", {
+      runId,
+      absSrc,
+      command,
+      timeoutMs,
+      hardMs,
+      mode,
+    });
+
+    let runResult: RunResult;
+
+    try {
+      runResult = await withHardTimeout(
+        runInSandbox({
+          repoPathOnHost: absSrc,
+          command,
+          timeoutMs,
+          cleanup,
+          dockerImage,
+          mode,
+          traceFile,
+        } as any),
+        hardMs,
+        async () => {
+          await trace(traceFile!, "snap.hard_timeout", {
+            runId,
+            hardMs,
+            timeoutMs,
+            mode,
+          });
+          await appendStep(runId!, {
+            type: "sandbox.timeout",
+            message: `Runner exceeded hard timeout (${hardMs}ms)`,
+            ts: Date.now(),
+            meta: { hardTimeoutMs: hardMs, timeoutMs, mode },
           });
         }
-      } catch (e: any) {
-        console.warn(
-          "clineFetchExample failed for repo",
-          r,
-          e?.message || e
-        );
-      }
-    }
-
-    // 3) Call Oumi to generate patch candidates
-    let suggestions: PatchSuggestion[] | null = null;
-    try {
-      suggestions = await generatePatchWithOumi({
-        repoPath: run.repoPathOnHost,
-        primaryError: primary,
-        contextFiles: snippets,
-        topRepos,
-      });
-    } catch (e: any) {
-      console.error("generatePatchWithOumi error:", e?.message || e);
-      return res.status(500).json({
-        ok: false,
-        error: "Oumi patch generation failed",
-        details: e?.message || String(e),
-      });
-    }
-
-    if (!suggestions || !suggestions.length) {
-      // save marker for no suggestion
-      run.suggestion = {
-        available: false,
-        generatedAt: new Date().toISOString(),
-      };
-      await saveRun(runId, run);
-      return res.json({
-        ok: true,
-        runId,
-        available: false,
-        message: "No suggestion available from Oumi.",
-      });
-    }
-
-    // persist patch suggestions
-    const patchPath = await savePatch(runId, suggestions);
-
-    // update run record
-    run.suggestions = suggestions;
-    run.suggestion = {
-      available: true,
-      path: patchPath,
-      generatedAt: new Date().toISOString(),
-    };
-    await saveRun(runId, run);
-
-    // start Kestra flow to verify suggestions (if Kestra configured)
-    let kestraResp: any = null;
-    try {
-      kestraResp = await startKestraFlow(runId, suggestions, {
-        command: run.command,
-      });
-      if (kestraResp && kestraResp.executionId) {
-        run.kestraExecution = {
-          id: kestraResp.executionId,
-          startedAt: new Date().toISOString(),
-          raw: kestraResp,
-        };
-        await saveRun(runId, run);
-      }
-    } catch (e: any) {
-      console.warn(
-        "startKestraFlow failed:",
-        e?.message || e
       );
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+
+      await trace(traceFile, "snap.catch_timeout_or_error", { runId, msg, mode });
+
+      runRecord.status = "timeout" as any;
+      runRecord.finishedAt = new Date().toISOString();
+      runRecord.lastUpdatedAt = new Date().toISOString();
+
+      runRecord.logPaths["sandbox.error"] = await writeLog(
+        runId,
+        "sandbox.error",
+        clampLog(
+          `Runner failed/timeout.\nerror=${msg}\ncommand=${command}\nrepo=${absSrc}\ntimeoutMs=${timeoutMs}\nhardMs=${hardMs}\nmode=${mode}`
+        )
+      );
+
+      await saveRun(runRecord);
+
+      try {
+        timeline.fail("sandbox.run", msg);
+        timeline.ok("run.complete", "timeout");
+        await timeline.flush();
+        timelineFlushed = true;
+      } catch {}
+
+      if (!isAborted()) {
+        return safeSendJson(res, 504, {
+          ok: false,
+          runId,
+          error: "SANDBOX_TIMEOUT",
+          message: `Runner did not complete within ${hardMs}ms (timeoutMs=${timeoutMs}).`,
+          logPaths: runRecord.logPaths,
+          runFile: runFilePath(runId),
+          traceFile,
+          mode,
+        });
+      }
+      return;
     }
 
-    return res.json({
+    const sbMs = performance.now() - sb0;
+
+    timeline.ok(
+      "sandbox.run",
+      `ok=${!!runResult.ok} exit=${runResult.code ?? 0} duration=${sbMs.toFixed(
+        0
+      )}ms mode=${(runResult as any).mode ?? mode}`
+    );
+
+    // POLICY: clamp logs
+    const safeStdout = clampLog(runResult.stdout || "");
+    const safeStderr = clampLog(runResult.stderr || "");
+
+    const stdoutPath = await writeLog(runId, "sandbox.stdout", safeStdout);
+    const stderrPath = await writeLog(runId, "sandbox.stderr", safeStderr);
+
+    runRecord.logPaths["sandbox.stdout"] = stdoutPath;
+    runRecord.logPaths["sandbox.stderr"] = stderrPath;
+
+    // Analyze
+    timeline.start("analysis.complete", "analyzing stdout/stderr");
+    const an0 = performance.now();
+    const analysis: Analysis = analyzeFromStdoutStderr(safeStdout, safeStderr);
+    const anMs = performance.now() - an0;
+    timeline.ok("analysis.complete", `duration=${anMs.toFixed(0)}ms`);
+
+    runRecord.finishedAt = new Date().toISOString();
+    runRecord.status = runResult.ok
+      ? ("finished" as RunStatus)
+      : ("failed" as RunStatus);
+
+    (runRecord as any).runResult = {
+      ...runResult,
+      stdout: safeStdout,
+      stderr: safeStderr,
+    };
+    (runRecord as any).analysis = analysis;
+
+    runRecord.lastUpdatedAt = new Date().toISOString();
+
+    await writeMetrics(runId, {
+      runId,
+      totalMs: Date.now() - wallT0,
+      sandboxMs: Math.round(sbMs),
+      analysisMs: Math.round(anMs),
+      ts: new Date().toISOString(),
+      mode: (runResult as any).mode ?? mode,
+    });
+
+    await saveRun(runRecord);
+
+    timeline.ok("run.complete", runRecord.status);
+    await timeline.flush();
+    timelineFlushed = true;
+
+    if (isAborted()) return;
+
+    return safeSendJson(res, 200, {
       ok: true,
       runId,
-      suggestion: {
-        confidence: suggestions[0]?.confidence || null,
-        notes: suggestions[0]?.notes || "",
-      },
-      patchPath,
-      kestra: kestraResp || null,
+      status: runRecord.status,
+      analysis,
+      runResult: (runRecord as any).runResult,
+      logPaths: runRecord.logPaths,
+      metricsPath: runRecord.metricsPath,
+      runFile: runFilePath(runId),
+      traceFile,
+      mode: (runResult as any).mode ?? mode,
     });
   } catch (e: any) {
-    console.error("Generate Error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
-  }
-});
+    console.error("runs/start error:", e);
 
-// --------------------------
-// POST /apply
-//   Apply saved patch suggestions (with backup)
-// --------------------------
-router.post("/apply", async (req, res) => {
-  try {
-    const runId = req.body?.runId;
-    const applyNow = !!req.body?.apply;
-    if (!runId)
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing runId" });
+    try {
+      if (traceFile) {
+        await trace(traceFile, "snap.top_level_error", {
+          err: e?.message || String(e),
+        });
+      }
+    } catch {}
 
-    const run = await readRun(runId).catch(() => null);
-    if (!run)
-      return res
-        .status(404)
-        .json({ ok: false, error: "run not found" });
+    try {
+      if (timeline && !timelineFlushed) {
+        timeline.fail("run.error", e?.message || String(e));
+        await timeline.flush();
+      }
+    } catch {}
 
-    if (!run.suggestion || !run.suggestion.available) {
-      return res.status(400).json({
+    if (!res.headersSent) {
+      return safeSendJson(res, 500, {
         ok: false,
-        error: "no suggestion available for this run",
+        error: "INTERNAL_ERROR",
+        message: e?.message || String(e),
+        traceFile,
+      });
+    }
+  }
+}
+
+router.post("/runs/start", requireApiKey, handleRunsStart);
+router.post("/snap", requireApiKey, handleRunsStart);
+
+// ============================================================
+// Helpers: run Cline via scripts/cline.sh
+// ============================================================
+function projectRoot(): string {
+  // When compiled, __dirname is backend/dist. This resolves to repo root.
+  return path.resolve(__dirname, "..", "..");
+}
+
+function clineScriptPath(): string {
+  return path.resolve(projectRoot(), "scripts", "cline.sh");
+}
+
+async function runGitDiff(repoPath: string): Promise<string> {
+  return await new Promise<string>((resolve) => {
+    const child = spawn("bash", ["-lc", `git -C "${repoPath}" diff`], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let out = "";
+    let err = "";
+
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.stderr.on("data", (d) => (err += d.toString()));
+
+    child.on("close", () => {
+      // If not a git repo, diff will be empty or stderr will mention it.
+      // We return stdout only; callers can store stderr separately if needed.
+      resolve(out || "");
+    });
+
+    child.on("error", () => resolve(""));
+  });
+}
+
+async function runClineFixOnce(opts: {
+  runId: string;
+  repoPath: string;
+  command: string;
+  analysisSummary: string;
+  stdout: string;
+  stderr: string;
+  hardMs: number;
+}): Promise<{ ok: boolean; output: string; reason?: string }> {
+  const script = clineScriptPath();
+  const scriptExists = await fs
+    .access(script)
+    .then(() => true)
+    .catch(() => false);
+
+  if (!scriptExists) {
+    return { ok: false, output: "", reason: `Missing ${script}` };
+  }
+
+  // Build stdin context (this becomes /workspace/.infinitysnap_stdin.txt inside container)
+  const ctx = [
+    `RunId: ${opts.runId}`,
+    `Repo: ${opts.repoPath}`,
+    `Command: ${opts.command}`,
+    ``,
+    `ANALYSIS SUMMARY:`,
+    opts.analysisSummary,
+    ``,
+    `STDERR (clamped):`,
+    clampLog(opts.stderr),
+    ``,
+    `STDOUT (clamped):`,
+    clampLog(opts.stdout),
+    ``,
+    `TASK: Fix the repo so "${opts.command}" passes.`,
+    `Constraints: small, minimal change; do not add new deps unless necessary; keep tests passing.`,
+  ].join("\n");
+
+  const task = `Fix the failing tests for command: ${opts.command}. Ensure all tests pass.`;
+
+  const p = new Promise<{ ok: boolean; output: string; reason?: string }>((resolve) => {
+    const child = spawn("bash", ["-lc", `"${script}" "${task.replace(/"/g, '\\"')}"`], {
+      cwd: projectRoot(),
+      env: {
+        ...process.env,
+        // IMPORTANT: backend must have keys in its env OR repo root .env loaded by script
+        // Keep these as-is; do not force.
+        CLINE_TELEMETRY_DISABLED: "1",
+        NO_COLOR: "1",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let out = "";
+    let err = "";
+
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.stderr.on("data", (d) => (err += d.toString()));
+
+    child.on("error", (e) => {
+      resolve({ ok: false, output: out + "\n" + err, reason: e.message });
+    });
+
+    child.on("close", (code) => {
+      const combined = (out + "\n" + err).trim();
+      resolve({ ok: code === 0, output: combined || "", reason: code === 0 ? undefined : `exit_${code}` });
+    });
+
+    // send stdin context
+    child.stdin.write(ctx);
+    child.stdin.end();
+  });
+
+  return await withHardTimeout(p, opts.hardMs, async () => {
+    // nothing else to do; process will be left to OS, but route will exit cleanly
+  });
+}
+
+// ============================================================
+// FIX PIPELINE (Cline-only): cline → diff → verify
+// POST /runs/:id/fix
+// ============================================================
+router.post("/runs/:id/fix", requireApiKey, async (req, res) => {
+  const runId = String(req.params.id || "").trim();
+
+  try {
+    await ensureReady();
+    assertValidRunId(runId);
+
+    const run = await readRun(runId).catch(() => null as any);
+    if (!run) {
+      return safeSendJson(res, 404, {
+        ok: false,
+        error: "NOT_FOUND",
+        message: "run not found",
       });
     }
 
-    const patchFile = run.suggestion.path;
-    const suggestion: PatchSuggestion[] = JSON.parse(
-      await fs.readFile(patchFile, "utf8")
-    );
+    const cmd = String(req.body?.command || run.command || "").trim();
+    if (!cmd) {
+      return safeSendJson(res, 400, { ok: false, error: "BAD_REQUEST", message: "missing command" });
+    }
 
-    const fileList = suggestion.flatMap((s) =>
-      s.files.map((f: PatchFile) => f.path)
-    );
+    // POLICY: validate command
+    const cmdDecision = checkCommand(cmd);
+    if (!cmdDecision.ok) {
+      return safeSendJson(res, 400, {
+        ok: false,
+        error: cmdDecision.code,
+        message: cmdDecision.reason,
+      });
+    }
 
-    if (!applyNow) {
-      return res.json({
+    const hardMs =
+      Number.isFinite(Number(req.body?.timeoutMs)) && Number(req.body?.timeoutMs) > 0
+        ? Math.max(10_000, Math.min(20 * 60_000, Number(req.body?.timeoutMs))) // up to 20 min
+        : 8 * 60_000; // default 8 min
+
+    const traceFile = path.join(artifactsDirFor(runId), "fix.trace.log");
+    await trace(traceFile, "fix.start", { runId, repoPath: run.repoPath, command: cmd, hardMs });
+
+    // Pull analysis/logs from run
+    const analysisSummary = String(run.analysis?.summary || run.analysis?.primary || "No analysis summary");
+    const stdoutPath = run?.logPaths?.["sandbox.stdout"];
+    const stderrPath = run?.logPaths?.["sandbox.stderr"];
+
+    const stdout = stdoutPath ? await fs.readFile(stdoutPath, "utf-8").catch(() => "") : "";
+    const stderr = stderrPath ? await fs.readFile(stderrPath, "utf-8").catch(() => "") : "";
+
+    // Run Cline
+    await appendStep(runId, { type: "fix.cline.start", message: "Running Cline fix", ts: Date.now(), meta: { hardMs } });
+
+    const cl = await runClineFixOnce({
+      runId,
+      repoPath: run.repoPath,
+      command: cmd,
+      analysisSummary,
+      stdout,
+      stderr,
+      hardMs,
+    });
+
+    run.logPaths = run.logPaths || {};
+    run.logPaths["fix.cline.output"] = await writeLog(runId, "fix.cline.output", clampLog(cl.output || ""));
+    run.lastUpdatedAt = new Date().toISOString();
+
+    if (!cl.ok) {
+      run.status = "failed";
+      await saveRun(run);
+      return safeSendJson(res, 200, {
         ok: true,
         runId,
-        willApply: fileList,
-        message:
-          "call again with apply=true to actually write files",
+        status: "cline_failed",
+        message: "Cline did not complete successfully (see fix.cline.output log).",
+        traceFile,
+        logPaths: run.logPaths,
       });
     }
 
-    // Apply: write each file's `after` content to disk, with backup
-    const backupDir = path.join(ARTIFACTS_DIR, runId, "backup");
-    await fs.mkdir(backupDir, { recursive: true });
+    await appendStep(runId, { type: "fix.diff", message: "Capturing git diff", ts: Date.now() });
 
-    for (const s of suggestion) {
-      for (const f of s.files) {
-        const absPath = path.isAbsolute(f.path)
-          ? f.path
-          : path.join(run.repoPathOnHost, f.path);
-
-        try {
-          const before = await fs
-            .readFile(absPath, "utf8")
-            .catch(() => null);
-          const rel = path
-            .relative(run.repoPathOnHost, absPath)
-            .replace(/\//g, "_");
-          await fs.writeFile(
-            path.join(backupDir, `${rel}.before`),
-            before ?? "",
-            "utf8"
-          );
-        } catch {
-          // ignore read error for new files
-        }
-
-        await fs.mkdir(path.dirname(absPath), {
-          recursive: true,
-        });
-        await fs.writeFile(absPath, f.after, "utf8");
-      }
+    // Save git diff (best-effort)
+    const diff = await runGitDiff(run.repoPath);
+    if (diff) {
+      await fs.writeFile(diffFilePath(runId), diff, "utf8").catch(() => {});
+      run.diffPath = diffFilePath(runId);
+      // store a copy as patch too (so dashboard can show something)
+      await fs.writeFile(patchFilePath(runId), JSON.stringify([], null, 2), "utf8").catch(() => {});
+      run.patchPath = patchFilePath(runId);
+    } else {
+      // not a git repo or no diff; still proceed to verify
+      run.diffPath = null;
     }
 
-    run.applied = {
-      appliedAt: new Date().toISOString(),
-      files: fileList,
-    };
-    await saveRun(runId, run);
+    run.status = "applied";
+    run.applied = { appliedAt: new Date().toISOString(), files: [] };
+    await saveRun(run);
 
-    return res.json({ ok: true, runId, applied: fileList });
-  } catch (e: any) {
-    console.error("Apply Error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
-  }
-});
+    // Verify
+    await appendStep(runId, { type: "fix.verify.start", message: "Verifying after Cline", ts: Date.now(), meta: { command: cmd } });
 
-// --------------------------
-// POST /verify
-// --------------------------
-router.post("/verify", async (req, res) => {
-  try {
-    const runId = req.body?.runId;
-    const cmd = req.body?.command;
-    const timeoutMs = req.body?.timeoutMs;
-
-    if (!runId)
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing runId" });
-
-    const run = await readRun(runId).catch(() => null);
-    if (!run)
-      return res
-        .status(404)
-        .json({ ok: false, error: "run not found" });
-
-    // pick command: parameter or original run command
-    const commandToRun =
-      cmd || run.command || run.runResult?.command || "npm test";
-
-    const verifyResult: RunResult = await runInSandbox({
-      repoPathOnHost: run.repoPathOnHost,
-      command: commandToRun,
-      timeoutMs,
-      cleanup: true,
+    const vr = await verifyRun(runId, {
+      command: cmd,
+      timeoutMs: req.body?.timeoutMs,
       dockerImage: req.body?.dockerImage,
     });
 
-    run.verify = {
-      verifiedAt: new Date().toISOString(),
-      result: verifyResult,
-    };
-    await saveRun(runId, run);
+    run.status = vr.verifyResult?.ok ? "verified" : "failed";
+    run.lastUpdatedAt = new Date().toISOString();
+    await saveRun(run);
 
-    return res.json({ ok: true, runId, verify: verifyResult });
+    return safeSendJson(res, 200, {
+      ok: true,
+      runId,
+      status: run.status,
+      diffPath: run.diffPath,
+      verify: vr.verifyResult,
+      logPaths: vr.logPaths,
+      traceFile,
+    });
   } catch (e: any) {
-    console.error("Verify Error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// --------------------------
-// POST /results/:runId/kestra-callback
-// Kestra will POST candidate verification results here
-// --------------------------
-router.post(
-  "/results/:runId/kestra-callback",
-  async (req, res) => {
-    try {
-      const runId = req.params.runId;
-      const payload = req.body;
-
-      if (!runId)
-        return res
-          .status(400)
-          .json({ ok: false, error: "missing runId" });
-
-      const run = await readRun(runId).catch(() => null);
-      if (!run)
-        return res
-          .status(404)
-          .json({ ok: false, error: "run not found" });
-
-      const items = Array.isArray(payload) ? payload : [payload];
-
-      run.verifications = run.verifications || {};
-      for (const it of items) {
-        const cid = it.candidateId || it.id || "unknown";
-        run.verifications[cid] = run.verifications[cid] || {};
-        run.verifications[cid][it.env || "default"] = {
-          ok: !!it.ok,
-          logs: it.logs || it.output || "",
-          ts: new Date().toISOString(),
-        };
-      }
-
-      // compute aggregate winner heuristic (simple: highest pass count then confidence)
-      const scores: {
-        cid: string;
-        passCount: number;
-        confidence: number;
-      }[] = [];
-      const candidateList: any[] = run.suggestions || [];
-      for (const c of candidateList) {
-        const cid =
-          c.id ||
-          (c.files && c.files[0] && c.files[0].path) ||
-          "c-unknown";
-        const v = run.verifications[cid] || {};
-        const passCount = Object.values(v).filter(
-          (x: any) => x.ok
-        ).length;
-        scores.push({
-          cid,
-          passCount,
-          confidence: c.confidence || 0,
-        });
-      }
-
-      scores.sort((a, b) => {
-        if (b.passCount !== a.passCount)
-          return b.passCount - a.passCount;
-        return (b.confidence || 0) - (a.confidence || 0);
-      });
-
-      if (scores.length) {
-        run.aggregate = {
-          winner: scores[0].cid,
-          scores,
-          computedAt: new Date().toISOString(),
-        };
-      }
-
-      await saveRun(runId, run);
-      return res.json({ ok: true, updated: true });
-    } catch (e: any) {
-      console.error("Kestra callback error:", e);
-      return res
-        .status(500)
-        .json({ ok: false, error: e?.message || String(e) });
-    }
-  }
-);
-
-// --------------------------
-// GET /results  -> list saved runs
-// --------------------------
-router.get("/results", async (_req, res) => {
-  try {
-    const files = await fs.readdir(RESULTS_DIR);
-    const jsonFiles = files
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => {
-        const id = f.replace(".json", "");
-        const ts = parseInt(id.split("-")[0], 36) || Date.now();
-        return { file: f, id, ts, path: path.join(RESULTS_DIR, f) };
-      })
-      .sort((a, b) => b.ts - a.ts);
-
-    res.json({ ok: true, results: jsonFiles });
-  } catch (e: any) {
-    console.error("Results list error:", e);
-    res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// --------------------------
-// GET /results/:file
-// --------------------------
-router.get("/results/:file", async (req, res) => {
-  try {
-    const file = req.params.file;
-    if (!file || !file.endsWith(".json")) {
-      return res.status(400).json({
-        ok: false,
-        error: "invalid filename; must end with .json",
-      });
-    }
-
-    const full = path.join(RESULTS_DIR, file);
-    const resolved = path.resolve(full);
-    if (!resolved.startsWith(path.resolve(RESULTS_DIR))) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "invalid file path" });
-    }
-
-    const data = await fs.readFile(full, "utf8");
-    const parsed = JSON.parse(data);
-    res.json({ ok: true, file, data: parsed });
-  } catch (e: any) {
-    console.error("Results fetch error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
+    console.error("Fix Error:", e);
+    return safeSendJson(res, 500, {
+      ok: false,
+      error: "INTERNAL_ERROR",
+      message: e?.message || String(e),
+    });
   }
 });
 
 export default router;
-
-// --------------------------
-// Helper: startKestraFlow
-// --------------------------
-async function startKestraFlow(
-  runId: string,
-  suggestions: PatchSuggestion[],
-  opts: { command?: string } = {}
-) {
-  const kestraApi = process.env.KESTRA_API_URL;
-  const kestraKey = process.env.KESTRA_API_KEY;
-  if (!kestraApi || !kestraKey) {
-    console.warn(
-      "Kestra not configured (KESTRA_API_URL/KESTRA_API_KEY). Skipping flow start."
-    );
-    return null;
-  }
-
-  const candidates = (suggestions || []).map((s) => ({
-    id: s.id || `${Math.random().toString(36).slice(2, 8)}`,
-    confidence: s.confidence || 0,
-    notes: s.notes || "",
-    files: s.files || [],
-  }));
-
-  const backendUrl =
-    process.env.BACKEND_URL ||
-    `http://localhost:${process.env.PORT || 3000}`;
-
-  const body = {
-    inputs: {
-      runId,
-      backendUrl,
-      backendApiKey: process.env.BACKEND_API_KEY || "",
-      command: opts.command || "npm test",
-      dockerImage: process.env.DEFAULT_VERIFY_IMAGE || "node:18",
-      candidates,
-      artifactsDir: path.join(ARTIFACTS_DIR, runId),
-      callbackUrl: `${backendUrl}/results/${runId}/kestra-callback`,
-    },
-  };
-
-  try {
-    const flowNamespace =
-      process.env.KESTRA_FLOW_NAMESPACE || "infinitysnap";
-    const flowId =
-      process.env.KESTRA_FLOW_ID || "infinitysnap.verify";
-
-    const resp = await axios.post(
-      `${kestraApi}/api/flows/${flowNamespace}/${flowId}/executions`,
-      body,
-      {
-        headers: {
-          Authorization: `Bearer ${kestraKey}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 15_000,
-      }
-    );
-
-    return {
-      executionId:
-        resp.data?.id || resp.data?.executionId || resp.data,
-    };
-  } catch (e: any) {
-    console.error(
-      "startKestraFlow error:",
-      e?.response?.data || e?.message || e
-    );
-    throw e;
-  }
-}
