@@ -238,8 +238,6 @@ GET /api/v1/runs/:id/timeline.json
 
 ## 📸 Screenshots
 
-Place real screenshots under `docs/screenshots/` and reference them here:
-
 ```md
 ![CLI Fix Pipeline](docs/screenshots/01-cli-fix-pipeline.png)
 ![Timeline Replay](docs/screenshots/02-timeline-replay.png)
@@ -324,7 +322,7 @@ infinitysnap fix . --command "npm test"
 
 ## 🔌 API Reference
 
-Base URL:
+### Base URL:
 ```
 http://localhost:4000/api/v1
 ```
