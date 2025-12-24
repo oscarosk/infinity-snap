@@ -2,7 +2,6 @@
 import express from "express";
 import path from "path";
 import fs from "fs/promises";
-import { performance } from "perf_hooks";
 import { spawn } from "node:child_process";
 
 import { runInSandbox, RunResult } from "./sandboxRunner";
@@ -18,21 +17,19 @@ import {
   writeLog,
   writeMetrics,
   listRuns,
-  runFilePath,
   metricsFilePath,
   patchFilePath,
   diffFilePath,
   artifactsDirFor,
   timelineFilePath,
   timelineJsonPath,
-  timelineJsonPath as _timelineJsonPath, // (kept for compat)
 } from "./runStore";
 
-import { generateRunId, PATCHES_DIR } from "./util";
+import { generateRunId } from "./util";
 import { verifyRun } from "./verifier";
 import { checkCommand, clampLog } from "./policy";
 
-import type { RunStatus, RunStepEntry, RunRecord } from "./types";
+import type { RunRecord } from "./types";
 
 const router = express.Router();
 
@@ -43,9 +40,7 @@ function requireApiKey(req: any, res: any, next: any) {
   const key = (process.env.BACKEND_API_KEY || "").trim();
   if (!key) return next();
   const got = (req.headers["x-api-key"] || "").toString().trim();
-  if (got !== key) {
-    return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
-  }
+  if (got !== key) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
   next();
 }
 
@@ -61,12 +56,50 @@ function assertValidRunId(runId: string) {
   if (!RUN_ID_RE.test(runId)) throw new Error("invalid runId");
 }
 
+/**
+ * ✅ Safe JSON stringify:
+ * - handles BigInt (stringifies)
+ * - handles circular refs (replaces with "[Circular]")
+ * - handles Error objects (keeps message/stack)
+ */
+function safeJsonStringify(value: any): string {
+  const seen = new WeakSet<object>();
+
+  return JSON.stringify(
+    value,
+    (_k, v) => {
+      if (typeof v === "bigint") return v.toString();
+
+      if (v instanceof Error) {
+        return { name: v.name, message: v.message, stack: v.stack };
+      }
+
+      if (v && typeof v === "object") {
+        if (seen.has(v)) return "[Circular]";
+        seen.add(v);
+      }
+
+      return v;
+    },
+    2
+  );
+}
+
+/**
+ * ✅ Bulletproof JSON responder
+ * Prevents Express from sending "Internal Server Error" text when res.json() fails.
+ */
 function safeSendJson(res: any, status: number, body: any) {
   if (res.headersSent) return;
   try {
-    res.status(status).json(body);
+    const payload = safeJsonStringify(body);
+    res.status(status);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.send(payload);
   } catch {
-    // ignore
+    try {
+      res.status(500).type("text/plain").send("Internal Server Error");
+    } catch {}
   }
 }
 
@@ -112,12 +145,18 @@ async function withHardTimeout<T>(
   }
 }
 
+function normalizeTimeoutMs(v: any, fallback: number) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.max(1_000, n);
+}
+
 // ============================================================
 // Health
 // ============================================================
 router.get("/health", async (_req, res) => {
   await ensureReady();
-  res.json({ ok: true, ts: Date.now(), service: "InfinitySnap backend" });
+  safeSendJson(res, 200, { ok: true, ts: Date.now(), service: "InfinitySnap backend" });
 });
 
 // ============================================================
@@ -127,14 +166,10 @@ router.get("/runs", async (_req, res) => {
   try {
     await ensureReady();
     const runs = await listRuns();
-    res.json({ ok: true, runs });
+    safeSendJson(res, 200, { ok: true, runs });
   } catch (e: any) {
     console.error("runs list error:", e);
-    res.status(500).json({
-      ok: false,
-      error: "INTERNAL_ERROR",
-      message: e?.message || String(e),
-    });
+    safeSendJson(res, 500, { ok: false, error: "INTERNAL_ERROR", message: e?.message || String(e) });
   }
 });
 
@@ -143,14 +178,10 @@ router.get("/results", async (_req, res) => {
   try {
     await ensureReady();
     const runs = await listRuns();
-    res.json({ ok: true, runs });
+    safeSendJson(res, 200, { ok: true, runs });
   } catch (e: any) {
     console.error("results alias error:", e);
-    res.status(500).json({
-      ok: false,
-      error: "INTERNAL_ERROR",
-      message: e?.message || String(e),
-    });
+    safeSendJson(res, 500, { ok: false, error: "INTERNAL_ERROR", message: e?.message || String(e) });
   }
 });
 
@@ -163,16 +194,68 @@ router.get("/runs/:id", async (req, res) => {
     const runId = String(req.params.id || "");
     assertValidRunId(runId);
     const data = await readRun(runId);
-    res.json({ ok: true, runId, data });
+    safeSendJson(res, 200, { ok: true, runId, data });
   } catch {
-    res
-      .status(404)
-      .json({ ok: false, error: "NOT_FOUND", message: "run not found" });
+    safeSendJson(res, 404, { ok: false, error: "NOT_FOUND", message: "run not found" });
   }
 });
 
 // ============================================================
-// Logs / Diff / Patch (so CLI/dashboard don’t 404)
+// Artifacts index (UI expects this)
+// ============================================================
+router.get("/runs/:id/artifacts", async (req, res) => {
+  try {
+    await ensureReady();
+    const runId = String(req.params.id || "");
+    assertValidRunId(runId);
+
+    const run = await readRun(runId);
+
+    const diffP = run?.diffPath || diffFilePath(runId);
+    const patchP = run?.patchPath || patchFilePath(runId);
+    const tlTxtP = timelineFilePath(runId);
+    const tlJsonP = timelineJsonPath(runId);
+    const artDir = run?.artifactsDir || artifactsDirFor(runId);
+
+    const exists = async (p: string) => {
+      try {
+        await fs.stat(p);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const [hasDiff, hasPatch, hasTimelineTxt, hasTimelineJson, hasArtifactsDir] = await Promise.all([
+      exists(diffP),
+      exists(patchP),
+      exists(tlTxtP),
+      exists(tlJsonP),
+      exists(artDir),
+    ]);
+
+    safeSendJson(res, 200, {
+      ok: true,
+      runId,
+      status: run?.status || "unknown",
+      artifactsDir: artDir,
+      hasDiff,
+      hasPatch,
+      hasTimeline: hasTimelineTxt || hasTimelineJson || (Array.isArray(run?.steps) && run.steps.length > 0),
+      logs: run?.logPaths
+        ? Object.entries(run.logPaths).map(([name, p]) => ({ name, path: p, exists: true }))
+        : [],
+      confidence: run?.analysis?.confidence ?? run?.confidence ?? null,
+      durationMs: run?.runResult?.durationMs ?? null,
+      hasArtifactsDir,
+    });
+  } catch {
+    safeSendJson(res, 404, { ok: false, error: "NOT_FOUND", message: "run not found" });
+  }
+});
+
+// ============================================================
+// Logs / Diff / Patch
 // ============================================================
 router.get("/runs/:id/logs", async (req, res) => {
   try {
@@ -183,18 +266,17 @@ router.get("/runs/:id/logs", async (req, res) => {
     const run = await readRun(runId);
     const logName = String(req.query?.name || "").trim();
 
-    // if ?name=sandbox.stdout return that file content
     if (logName) {
       const p = run?.logPaths?.[logName];
-      if (!p) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      if (!p) return safeSendJson(res, 404, { ok: false, error: "NOT_FOUND" });
       const txt = await fs.readFile(p, "utf-8");
-      return res.type("text/plain").send(txt);
+      res.type("text/plain").send(txt);
+      return;
     }
 
-    // else return map
-    return res.json({ ok: true, runId, logPaths: run?.logPaths || {} });
+    safeSendJson(res, 200, { ok: true, runId, logPaths: run?.logPaths || {} });
   } catch {
-    return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    safeSendJson(res, 404, { ok: false, error: "NOT_FOUND" });
   }
 });
 
@@ -204,9 +286,9 @@ router.get("/runs/:id/diff", async (req, res) => {
     const runId = String(req.params.id || "");
     assertValidRunId(runId);
     const txt = await fs.readFile(diffFilePath(runId), "utf-8");
-    return res.type("text/plain").send(txt);
+    res.type("text/plain").send(txt);
   } catch {
-    return res.status(404).type("text/plain").send("");
+    res.status(404).type("text/plain").send("");
   }
 });
 
@@ -216,9 +298,9 @@ router.get("/runs/:id/patch", async (req, res) => {
     const runId = String(req.params.id || "");
     assertValidRunId(runId);
     const txt = await fs.readFile(patchFilePath(runId), "utf-8");
-    return res.type("application/json").send(txt);
+    res.type("application/json").send(txt);
   } catch {
-    return res.status(404).type("application/json").send("[]");
+    res.status(200).type("application/json").send("[]");
   }
 });
 
@@ -243,7 +325,7 @@ router.get("/runs/:id/timeline.json", async (req, res) => {
     const runId = String(req.params.id || "");
     assertValidRunId(runId);
     const json = await fs.readFile(timelineJsonPath(runId), "utf-8");
-    res.json(JSON.parse(json));
+    safeSendJson(res, 200, JSON.parse(json));
   } catch {
     res.status(404).type("text/plain").send("No timeline json for this run yet.");
   }
@@ -253,331 +335,177 @@ router.get("/runs/:id/timeline.json", async (req, res) => {
 // POST /runs/start  (Alias: POST /snap)
 // ============================================================
 async function handleRunsStart(req: any, res: any) {
-  let runId: string | null = null;
-  let timeline: Timeline | null = null;
-  let timelineFlushed = false;
-  let traceFile: string | null = null;
-
-  const isAborted = createAbortLatch(req, res);
+  const aborted = createAbortLatch(req, res);
 
   try {
     await ensureReady();
-    const wallT0 = Date.now();
 
-    const rawPath: string | undefined =
-      req.body?.repoPathOnHost ||
-      req.body?.repoHostPath ||
-      req.body?.path ||
-      req.body?.repoPath;
+    const repoPathOnHost = String(req.body?.repoPathOnHost || "").trim();
+    const command = String(req.body?.command || "").trim();
 
-    const command: string | undefined = req.body?.command;
+    if (!repoPathOnHost)
+      return safeSendJson(res, 400, { ok: false, error: "BAD_REQUEST", message: "missing repoPathOnHost" });
+    if (!command)
+      return safeSendJson(res, 400, { ok: false, error: "BAD_REQUEST", message: "missing command" });
 
-    const timeoutMsRaw: number | undefined = req.body?.timeoutMs;
-    const timeoutMs: number = Number.isFinite(Number(timeoutMsRaw))
-      ? Math.max(1_000, Number(timeoutMsRaw))
-      : 60_000;
-
-    const cleanup: boolean =
-      req.body?.cleanup === undefined ? true : !!req.body?.cleanup;
-
-    const dockerImage: string | undefined = req.body?.dockerImage;
-
-    if (!rawPath || !command) {
-      return safeSendJson(res, 400, {
-        ok: false,
-        error: "BAD_REQUEST",
-        message:
-          "Require repoPathOnHost (or repoHostPath/path/repoPath) and command.",
-      });
-    }
-
-    // POLICY: validate command
     const cmdDecision = checkCommand(command);
     if (!cmdDecision.ok) {
-      return safeSendJson(res, 400, {
-        ok: false,
-        error: cmdDecision.code,
-        message: cmdDecision.reason,
-      });
+      return safeSendJson(res, 400, { ok: false, error: cmdDecision.code, message: cmdDecision.reason });
     }
 
-    // Resolve repo path robustly
-    const candidates = [
-      path.resolve(rawPath),
-      path.resolve(process.cwd(), rawPath),
-      path.resolve(__dirname, "../../", rawPath),
-    ];
+    const runId = generateRunId();
+    const nowIso = new Date().toISOString();
 
-    let absSrc: string | null = null;
-    let lastErr: any = null;
+    const artDir = artifactsDirFor(runId);
+    const timelinePath = timelineFilePath(runId);
+    const timeline = new Timeline(timelinePath);
 
-    for (const c of candidates) {
-      try {
-        await fs.access(c);
-        absSrc = c;
-        break;
-      } catch (e) {
-        lastErr = e;
-      }
-    }
+    // keep a separate trace file (NOT the timeline txt)
+    const traceFile = path.join(artDir, "snap.trace.log");
 
-    if (!absSrc) {
-      return safeSendJson(res, 400, {
-        ok: false,
-        error: "SOURCE_NOT_FOUND",
-        message: `Source path not found. Tried:\n${candidates.join(
-          "\n"
-        )}\nLast error: ${lastErr?.message || lastErr}`,
-      });
-    }
+    timeline.start("run.start", "sandbox.run", { repoPathOnHost, command });
+    await timeline.flush().catch(() => {});
 
-    runId = generateRunId();
-    traceFile = path.join(artifactsDirFor(runId), "snap.trace.log");
-
-    await trace(traceFile, "snap.start", {
+    const run: RunRecord = {
       runId,
-      rawPath,
-      absSrc,
+      repoPath: repoPathOnHost,
       command,
-      timeoutMs,
-      cleanup,
-      dockerImage: dockerImage ?? null,
-    });
-
-    // Runner mode:
-    // Default = DIRECT (fast)
-    // Set INFINITYSNAP_SAFE_MODE=1 to force SANDBOX
-    const safeMode = String(process.env.INFINITYSNAP_SAFE_MODE || "").trim() === "1";
-    const mode = safeMode ? "sandbox" : "direct";
-
-    timeline = new Timeline(timelineFilePath(runId));
-    timeline.start("run.init", "initializing", { repoPath: absSrc, command, mode });
-
-    const runRecord: RunRecord = {
-      runId,
-      repoPath: absSrc,
-      command,
-      status: "running" as RunStatus,
-      createdAt: new Date().toISOString(),
-      finishedAt: null,
-      lastUpdatedAt: new Date().toISOString(),
-      steps: [] as RunStepEntry[],
+      status: "running" as any,
+      createdAt: nowIso,
+      startedAt: nowIso as any,
+      lastUpdatedAt: nowIso,
+      finishedAt: null as any,
+      steps: [],
       logPaths: {},
-      diffPath: null,
       confidence: { score: null, reasons: [] } as any,
+      artifactsDir: artDir,
+      diffPath: null as any,
+      patchPath: null as any,
       metricsPath: metricsFilePath(runId),
-      patchPath: null,
-      artifactsDir: artifactsDirFor(runId),
-    };
+    } as any;
 
-    await saveRun(runRecord);
+    await saveRun(run);
+
+    await trace(traceFile, "snap.start", { runId, repoPathOnHost, command });
 
     await appendStep(runId, {
-      type: "run.start",
-      message: "Run initialized",
+      type: "sandbox.run",
+      message: "Running command in sandbox",
       ts: Date.now(),
-      meta: { repoPath: absSrc, command, dockerImage: dockerImage || null, mode },
+      meta: { command },
     });
 
-    // If client aborted before we began
-    if (isAborted()) {
-      await trace(traceFile, "snap.aborted_before_run", { runId });
-      runRecord.status = "aborted" as any;
-      runRecord.finishedAt = new Date().toISOString();
-      runRecord.lastUpdatedAt = new Date().toISOString();
-      await saveRun(runRecord);
-      try {
-        timeline.fail("run.aborted", "client_disconnected");
-        await timeline.flush();
-      } catch {}
-      return;
-    }
+    // SNAP still uses hard-timeout (good safety)
+    const timeoutMs = normalizeTimeoutMs(req.body?.timeoutMs ?? req.body?.runTimeoutSec * 1000, 180_000);
+    const hardMs = Math.max(10_000, timeoutMs + 5_000);
 
-    // Hard timeout so API returns cleanly
-    const hardMs = Math.max(70_000, timeoutMs + 10_000);
+    timeline.start("sandbox.exec", "sandbox.exec.start", { command, timeoutMs, hardMs });
+    await timeline.flush().catch(() => {});
 
-    timeline.start("sandbox.run", command, {
-      timeoutMs,
-      cleanup,
-      dockerImage: dockerImage ?? null,
-      mode,
+    await appendStep(runId, {
+      type: "sandbox.exec.start",
+      message: "Executing command",
+      ts: Date.now(),
+      meta: { command, timeoutMs },
     });
 
-    const sb0 = performance.now();
-    await trace(traceFile, "snap.before_runInSandbox", {
-      runId,
-      absSrc,
-      command,
-      timeoutMs,
-      hardMs,
-      mode,
-    });
+    const t0 = Date.now();
 
-    let runResult: RunResult;
-
+    let rr: RunResult;
     try {
-      runResult = await withHardTimeout(
+      rr = await withHardTimeout(
         runInSandbox({
-          repoPathOnHost: absSrc,
+          repoPathOnHost,
           command,
           timeoutMs,
-          cleanup,
-          dockerImage,
-          mode,
+          dockerImage: req.body?.dockerImage,
+          mode: req.body?.mode,
           traceFile,
         } as any),
         hardMs,
         async () => {
-          await trace(traceFile!, "snap.hard_timeout", {
-            runId,
-            hardMs,
-            timeoutMs,
-            mode,
-          });
-          await appendStep(runId!, {
-            type: "sandbox.timeout",
-            message: `Runner exceeded hard timeout (${hardMs}ms)`,
-            ts: Date.now(),
-            meta: { hardTimeoutMs: hardMs, timeoutMs, mode },
-          });
+          await trace(traceFile, "snap.hard_timeout", { runId, hardMs, timeoutMs });
+          timeline.fail("sandbox.exec", `hard_timeout_${hardMs}ms`);
+          await timeline.flush().catch(() => {});
         }
       );
     } catch (e: any) {
       const msg = e?.message || String(e);
+      await trace(traceFile, "snap.exception", { runId, msg });
 
-      await trace(traceFile, "snap.catch_timeout_or_error", { runId, msg, mode });
+      rr = {
+        ok: false,
+        code: null,
+        error: msg,
+        stdout: "",
+        stderr: msg,
+        command,
+        durationMs: Date.now() - t0,
+        execMs: null as any,
+        copyMs: null as any,
+        mode: "direct" as any,
+      } as any;
 
-      runRecord.status = "timeout" as any;
-      runRecord.finishedAt = new Date().toISOString();
-      runRecord.lastUpdatedAt = new Date().toISOString();
-
-      runRecord.logPaths["sandbox.error"] = await writeLog(
-        runId,
-        "sandbox.error",
-        clampLog(
-          `Runner failed/timeout.\nerror=${msg}\ncommand=${command}\nrepo=${absSrc}\ntimeoutMs=${timeoutMs}\nhardMs=${hardMs}\nmode=${mode}`
-        )
-      );
-
-      await saveRun(runRecord);
-
-      try {
-        timeline.fail("sandbox.run", msg);
-        timeline.ok("run.complete", "timeout");
-        await timeline.flush();
-        timelineFlushed = true;
-      } catch {}
-
-      if (!isAborted()) {
-        return safeSendJson(res, 504, {
-          ok: false,
-          runId,
-          error: "SANDBOX_TIMEOUT",
-          message: `Runner did not complete within ${hardMs}ms (timeoutMs=${timeoutMs}).`,
-          logPaths: runRecord.logPaths,
-          runFile: runFilePath(runId),
-          traceFile,
-          mode,
-        });
-      }
-      return;
+      timeline.fail("sandbox.exec", msg);
+      await timeline.flush().catch(() => {});
     }
 
-    const sbMs = performance.now() - sb0;
+    const durationMs = Math.max(0, Date.now() - t0);
 
-    timeline.ok(
-      "sandbox.run",
-      `ok=${!!runResult.ok} exit=${runResult.code ?? 0} duration=${sbMs.toFixed(
-        0
-      )}ms mode=${(runResult as any).mode ?? mode}`
-    );
+    if (rr?.code === 0) timeline.ok("sandbox.exec", "ok");
+    else timeline.ok("sandbox.exec", `exit_${rr?.code ?? "null"}`);
+    await timeline.flush().catch(() => {});
 
-    // POLICY: clamp logs
-    const safeStdout = clampLog(runResult.stdout || "");
-    const safeStderr = clampLog(runResult.stderr || "");
+    run.logPaths = run.logPaths || {};
+    run.logPaths["sandbox.stdout"] = await writeLog(runId, "sandbox.stdout", clampLog(String(rr?.stdout || "")));
+    run.logPaths["sandbox.stderr"] = await writeLog(runId, "sandbox.stderr", clampLog(String(rr?.stderr || "")));
 
-    const stdoutPath = await writeLog(runId, "sandbox.stdout", safeStdout);
-    const stderrPath = await writeLog(runId, "sandbox.stderr", safeStderr);
+    run.runResult = { ...(rr as any), durationMs } as any;
 
-    runRecord.logPaths["sandbox.stdout"] = stdoutPath;
-    runRecord.logPaths["sandbox.stderr"] = stderrPath;
+    // ---- Analyzer ----
+    timeline.start("run.analyze", "analysis.complete", {});
+    await timeline.flush().catch(() => {});
 
-    // Analyze
-    timeline.start("analysis.complete", "analyzing stdout/stderr");
-    const an0 = performance.now();
-    const analysis: Analysis = analyzeFromStdoutStderr(safeStdout, safeStderr);
-    const anMs = performance.now() - an0;
-    timeline.ok("analysis.complete", `duration=${anMs.toFixed(0)}ms`);
+    let analysis: Analysis = analyzeFromStdoutStderr(String(rr?.stdout || ""), String(rr?.stderr || ""));
 
-    runRecord.finishedAt = new Date().toISOString();
-    runRecord.status = runResult.ok
-      ? ("finished" as RunStatus)
-      : ("failed" as RunStatus);
+    if (rr?.ok === true && rr?.code === 0) {
+      analysis = {
+        ...(analysis as any),
+        summary: "Command succeeded.",
+        confidence: 95,
+        primaryErrorKind: "none",
+        errorDetected: false,
+        stackDetected: false,
+      } as any;
+    }
 
-    (runRecord as any).runResult = {
-      ...runResult,
-      stdout: safeStdout,
-      stderr: safeStderr,
-    };
-    (runRecord as any).analysis = analysis;
-
-    runRecord.lastUpdatedAt = new Date().toISOString();
+    run.analysis = analysis as any;
 
     await writeMetrics(runId, {
       runId,
-      totalMs: Date.now() - wallT0,
-      sandboxMs: Math.round(sbMs),
-      analysisMs: Math.round(anMs),
-      ts: new Date().toISOString(),
-      mode: (runResult as any).mode ?? mode,
+      command,
+      repoPathOnHost,
+      durationMs,
+      exitCode: rr?.code ?? null,
+      ts: Date.now(),
     });
 
-    await saveRun(runRecord);
+    run.status = "finished" as any;
+    run.finishedAt = new Date().toISOString();
+    run.lastUpdatedAt = new Date().toISOString();
 
-    timeline.ok("run.complete", runRecord.status);
-    await timeline.flush();
-    timelineFlushed = true;
+    timeline.start("run.complete", "finished", {});
+    timeline.ok("run.start", "finished");
+    timeline.ok("run.complete", "finished");
+    await timeline.flush().catch(() => {});
 
-    if (isAborted()) return;
+    await saveRun(run);
 
-    return safeSendJson(res, 200, {
-      ok: true,
-      runId,
-      status: runRecord.status,
-      analysis,
-      runResult: (runRecord as any).runResult,
-      logPaths: runRecord.logPaths,
-      metricsPath: runRecord.metricsPath,
-      runFile: runFilePath(runId),
-      traceFile,
-      mode: (runResult as any).mode ?? mode,
-    });
+    if (aborted()) return;
+    return safeSendJson(res, 200, { ok: true, runId, data: run });
   } catch (e: any) {
     console.error("runs/start error:", e);
-
-    try {
-      if (traceFile) {
-        await trace(traceFile, "snap.top_level_error", {
-          err: e?.message || String(e),
-        });
-      }
-    } catch {}
-
-    try {
-      if (timeline && !timelineFlushed) {
-        timeline.fail("run.error", e?.message || String(e));
-        await timeline.flush();
-      }
-    } catch {}
-
-    if (!res.headersSent) {
-      return safeSendJson(res, 500, {
-        ok: false,
-        error: "INTERNAL_ERROR",
-        message: e?.message || String(e),
-        traceFile,
-      });
-    }
+    return safeSendJson(res, 500, { ok: false, error: "INTERNAL_ERROR", message: e?.message || String(e) });
   }
 }
 
@@ -588,7 +516,6 @@ router.post("/snap", requireApiKey, handleRunsStart);
 // Helpers: run Cline via scripts/cline.sh
 // ============================================================
 function projectRoot(): string {
-  // When compiled, __dirname is backend/dist. This resolves to repo root.
   return path.resolve(__dirname, "..", "..");
 }
 
@@ -596,28 +523,29 @@ function clineScriptPath(): string {
   return path.resolve(projectRoot(), "scripts", "cline.sh");
 }
 
+function bashQuote(s: string): string {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
 async function runGitDiff(repoPath: string): Promise<string> {
   return await new Promise<string>((resolve) => {
-    const child = spawn("bash", ["-lc", `git -C "${repoPath}" diff`], {
+    const child = spawn("bash", ["-lc", `git -C ${bashQuote(repoPath)} diff`], {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
     let out = "";
-    let err = "";
+    if (child.stdout) child.stdout.on("data", (d) => (out += d.toString()));
 
-    child.stdout.on("data", (d) => (out += d.toString()));
-    child.stderr.on("data", (d) => (err += d.toString()));
-
-    child.on("close", () => {
-      // If not a git repo, diff will be empty or stderr will mention it.
-      // We return stdout only; callers can store stderr separately if needed.
-      resolve(out || "");
-    });
-
+    child.on("close", () => resolve(out || ""));
     child.on("error", () => resolve(""));
   });
 }
 
+/**
+ * Run one Cline fix pass.
+ * ✅ NO HARD TIMEOUT (fix-anyhow mode)
+ * - we only stop if the client disconnects / request is aborted at HTTP layer.
+ */
 async function runClineFixOnce(opts: {
   runId: string;
   repoPath: string;
@@ -625,50 +553,32 @@ async function runClineFixOnce(opts: {
   analysisSummary: string;
   stdout: string;
   stderr: string;
-  hardMs: number;
 }): Promise<{ ok: boolean; output: string; reason?: string }> {
   const script = clineScriptPath();
-  const scriptExists = await fs
-    .access(script)
-    .then(() => true)
-    .catch(() => false);
-
-  if (!scriptExists) {
-    return { ok: false, output: "", reason: `Missing ${script}` };
-  }
-
-  // Build stdin context (this becomes /workspace/.infinitysnap_stdin.txt inside container)
   const ctx = [
-    `RunId: ${opts.runId}`,
-    `Repo: ${opts.repoPath}`,
-    `Command: ${opts.command}`,
+    `context: InfinitySnap`,
+    `runId: ${opts.runId}`,
+    `repoPath: ${opts.repoPath}`,
+    `command: ${opts.command}`,
     ``,
-    `ANALYSIS SUMMARY:`,
-    opts.analysisSummary,
+    `analysisSummary:`,
+    opts.analysisSummary || "(none)",
     ``,
-    `STDERR (clamped):`,
-    clampLog(opts.stderr),
+    `stdout:`,
+    opts.stdout || "(empty)",
     ``,
-    `STDOUT (clamped):`,
-    clampLog(opts.stdout),
+    `stderr:`,
+    opts.stderr || "(empty)",
     ``,
-    `TASK: Fix the repo so "${opts.command}" passes.`,
-    `Constraints: small, minimal change; do not add new deps unless necessary; keep tests passing.`,
   ].join("\n");
 
-  const task = `Fix the failing tests for command: ${opts.command}. Ensure all tests pass.`;
+  const task = `Fix the failing repo. Apply minimal safe changes. Do not touch secrets. After changes, ensure "${opts.command}" passes.`;
+  const cmd = `cd ${bashQuote(opts.repoPath)} && ${bashQuote(script)} ${bashQuote(task)}`;
 
-  const p = new Promise<{ ok: boolean; output: string; reason?: string }>((resolve) => {
-    const child = spawn("bash", ["-lc", `"${script}" "${task.replace(/"/g, '\\"')}"`], {
-      cwd: projectRoot(),
-      env: {
-        ...process.env,
-        // IMPORTANT: backend must have keys in its env OR repo root .env loaded by script
-        // Keep these as-is; do not force.
-        CLINE_TELEMETRY_DISABLED: "1",
-        NO_COLOR: "1",
-      },
+  return await new Promise<{ ok: boolean; output: string; reason?: string }>((resolve) => {
+    const child = spawn("bash", ["-lc", cmd], {
       stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
     });
 
     let out = "";
@@ -677,78 +587,72 @@ async function runClineFixOnce(opts: {
     child.stdout.on("data", (d) => (out += d.toString()));
     child.stderr.on("data", (d) => (err += d.toString()));
 
-    child.on("error", (e) => {
-      resolve({ ok: false, output: out + "\n" + err, reason: e.message });
-    });
-
+    child.on("error", (e) => resolve({ ok: false, output: out + "\n" + err, reason: String(e) }));
     child.on("close", (code) => {
-      const combined = (out + "\n" + err).trim();
-      resolve({ ok: code === 0, output: combined || "", reason: code === 0 ? undefined : `exit_${code}` });
+      const merged = (out + (err ? `\n\n[stderr]\n${err}` : "")).trim();
+      resolve({ ok: code === 0, output: merged, reason: code === 0 ? undefined : `exit_${code}` });
     });
 
-    // send stdin context
-    child.stdin.write(ctx);
-    child.stdin.end();
-  });
-
-  return await withHardTimeout(p, opts.hardMs, async () => {
-    // nothing else to do; process will be left to OS, but route will exit cleanly
+    try {
+      child.stdin.write(ctx);
+      child.stdin.end();
+    } catch {}
   });
 }
 
 // ============================================================
 // FIX PIPELINE (Cline-only): cline → diff → verify
-// POST /runs/:id/fix
+// ✅ FIX-ANYHOW: no 60s hard timeout, no timeout_after_60000ms
 // ============================================================
 router.post("/runs/:id/fix", requireApiKey, async (req, res) => {
   const runId = String(req.params.id || "").trim();
+  const aborted = createAbortLatch(req, res);
 
   try {
     await ensureReady();
     assertValidRunId(runId);
 
+    const timeline = new Timeline(timelineFilePath(runId));
+
     const run = await readRun(runId).catch(() => null as any);
     if (!run) {
-      return safeSendJson(res, 404, {
-        ok: false,
-        error: "NOT_FOUND",
-        message: "run not found",
-      });
+      return safeSendJson(res, 404, { ok: false, error: "NOT_FOUND", message: "run not found" });
     }
 
     const cmd = String(req.body?.command || run.command || "").trim();
-    if (!cmd) {
-      return safeSendJson(res, 400, { ok: false, error: "BAD_REQUEST", message: "missing command" });
-    }
+    if (!cmd) return safeSendJson(res, 400, { ok: false, error: "BAD_REQUEST", message: "missing command" });
 
-    // POLICY: validate command
     const cmdDecision = checkCommand(cmd);
     if (!cmdDecision.ok) {
-      return safeSendJson(res, 400, {
-        ok: false,
-        error: cmdDecision.code,
-        message: cmdDecision.reason,
-      });
+      return safeSendJson(res, 400, { ok: false, error: cmdDecision.code, message: cmdDecision.reason });
     }
 
-    const hardMs =
-      Number.isFinite(Number(req.body?.timeoutMs)) && Number(req.body?.timeoutMs) > 0
-        ? Math.max(10_000, Math.min(20 * 60_000, Number(req.body?.timeoutMs))) // up to 20 min
-        : 8 * 60_000; // default 8 min
+    // ✅ IMPORTANT:
+    // Fix route does NOT hard-timeout. This prevents "timeout_after_60000ms" and CLI fallback.
+    timeline.start("fix.start", "start (running cline + verify)", { command: cmd, timeoutMs: 0 });
+    await timeline.flush().catch(() => {});
 
     const traceFile = path.join(artifactsDirFor(runId), "fix.trace.log");
-    await trace(traceFile, "fix.start", { runId, repoPath: run.repoPath, command: cmd, hardMs });
+    await trace(traceFile, "fix.start", { runId, repoPath: run.repoPath, command: cmd, timeoutMs: 0 });
 
-    // Pull analysis/logs from run
-    const analysisSummary = String(run.analysis?.summary || run.analysis?.primary || "No analysis summary");
+    const analysisSummary = String(run.analysis?.summary || "No analysis summary");
     const stdoutPath = run?.logPaths?.["sandbox.stdout"];
     const stderrPath = run?.logPaths?.["sandbox.stderr"];
 
     const stdout = stdoutPath ? await fs.readFile(stdoutPath, "utf-8").catch(() => "") : "";
     const stderr = stderrPath ? await fs.readFile(stderrPath, "utf-8").catch(() => "") : "";
 
-    // Run Cline
-    await appendStep(runId, { type: "fix.cline.start", message: "Running Cline fix", ts: Date.now(), meta: { hardMs } });
+    await appendStep(runId, { type: "fix.cline.start", message: "Running Cline fix", ts: Date.now(), meta: { timeoutMs: 0 } });
+
+    timeline.start("fix.cline", "cline.execute", { timeoutMs: 0 });
+    await timeline.flush().catch(() => {});
+
+    // If client disconnects, stop early (don’t keep working forever)
+    if (aborted()) {
+      timeline.fail("fix.cline", "client_aborted");
+      await timeline.flush().catch(() => {});
+      return;
+    }
 
     const cl = await runClineFixOnce({
       runId,
@@ -757,7 +661,6 @@ router.post("/runs/:id/fix", requireApiKey, async (req, res) => {
       analysisSummary,
       stdout,
       stderr,
-      hardMs,
     });
 
     run.logPaths = run.logPaths || {};
@@ -765,6 +668,12 @@ router.post("/runs/:id/fix", requireApiKey, async (req, res) => {
     run.lastUpdatedAt = new Date().toISOString();
 
     if (!cl.ok) {
+      timeline.fail("fix.cline", cl.reason || "cline_failed");
+
+      timeline.start("fix.complete", "finished", {});
+      timeline.ok("fix.complete", "cline_failed");
+      await timeline.flush().catch(() => {});
+
       run.status = "failed";
       await saveRun(run);
       return safeSendJson(res, 200, {
@@ -777,37 +686,63 @@ router.post("/runs/:id/fix", requireApiKey, async (req, res) => {
       });
     }
 
+    timeline.ok("fix.cline", "ok");
+    await timeline.flush().catch(() => {});
+
     await appendStep(runId, { type: "fix.diff", message: "Capturing git diff", ts: Date.now() });
 
-    // Save git diff (best-effort)
+    timeline.start("fix.diff", "capturing git diff", {});
+    await timeline.flush().catch(() => {});
+
     const diff = await runGitDiff(run.repoPath);
     if (diff) {
       await fs.writeFile(diffFilePath(runId), diff, "utf8").catch(() => {});
       run.diffPath = diffFilePath(runId);
-      // store a copy as patch too (so dashboard can show something)
+
+      // keep placeholder stable
       await fs.writeFile(patchFilePath(runId), JSON.stringify([], null, 2), "utf8").catch(() => {});
       run.patchPath = patchFilePath(runId);
+
+      timeline.ok("fix.diff", `diff_bytes=${diff.length}`);
     } else {
-      // not a git repo or no diff; still proceed to verify
       run.diffPath = null;
+      timeline.ok("fix.diff", "no_changes");
     }
+
+    await timeline.flush().catch(() => {});
 
     run.status = "applied";
     run.applied = { appliedAt: new Date().toISOString(), files: [] };
     await saveRun(run);
 
-    // Verify
-    await appendStep(runId, { type: "fix.verify.start", message: "Verifying after Cline", ts: Date.now(), meta: { command: cmd } });
+    await appendStep(runId, {
+      type: "fix.verify.start",
+      message: "Verifying after Cline",
+      ts: Date.now(),
+      meta: { command: cmd },
+    });
 
+    timeline.start("fix.verify", "re-running command", { command: cmd });
+    await timeline.flush().catch(() => {});
+
+    // Verification can still be time-bounded by backend verifier / sandboxRunner;
+    // but we do NOT kill the whole /fix HTTP request with a 60s wrapper.
     const vr = await verifyRun(runId, {
       command: cmd,
-      timeoutMs: req.body?.timeoutMs,
+      timeoutMs: req.body?.verifyTimeoutMs ?? req.body?.timeoutMs, // allow override if you want
       dockerImage: req.body?.dockerImage,
     });
 
     run.status = vr.verifyResult?.ok ? "verified" : "failed";
     run.lastUpdatedAt = new Date().toISOString();
     await saveRun(run);
+
+    if (vr.verifyResult?.ok) timeline.ok("fix.verify", "ok");
+    else timeline.fail("fix.verify", "failed");
+
+    timeline.start("fix.complete", "finished", {});
+    timeline.ok("fix.complete", run.status);
+    await timeline.flush().catch(() => {});
 
     return safeSendJson(res, 200, {
       ok: true,
@@ -820,11 +755,7 @@ router.post("/runs/:id/fix", requireApiKey, async (req, res) => {
     });
   } catch (e: any) {
     console.error("Fix Error:", e);
-    return safeSendJson(res, 500, {
-      ok: false,
-      error: "INTERNAL_ERROR",
-      message: e?.message || String(e),
-    });
+    return safeSendJson(res, 500, { ok: false, error: "INTERNAL_ERROR", message: e?.message || String(e) });
   }
 });
 

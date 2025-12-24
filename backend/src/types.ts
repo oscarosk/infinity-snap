@@ -83,6 +83,10 @@ export interface RunRecord {
   status: RunStatus;
 
   createdAt: string;
+
+  // ✅ ADD: UI expects this; good for judge narrative
+  startedAt?: string | null;
+
   finishedAt: string | null;
   lastUpdatedAt: string;
 

@@ -21,3 +21,21 @@ backend/data/
 # --- OS/editor ---
 .DS_Store
 Thumbs.db
+
+# Backups / scratch
+_backup/
+
+# Runtime artifacts
+.infinitysnap/
+backend/.data/
+backend/.logs/
+
+# Node build output (keep if your repo does NOT commit dist)
+cli/dist/
+
+# Node
+node_modules/
+
+# OS/editor
+.DS_Store
+.vscode/

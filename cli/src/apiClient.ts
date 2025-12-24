@@ -15,6 +15,20 @@ function isAxiosError(e: any): e is AxiosError {
   return !!e?.isAxiosError;
 }
 
+function isTimeoutError(e: any): boolean {
+  // axios timeout typically sets code = 'ECONNABORTED'
+  return !!(
+    e &&
+    (e.code === "ECONNABORTED" ||
+      String(e.message || "").toLowerCase().includes("timeout"))
+  );
+}
+
+function isConnRefused(e: any): boolean {
+  const code = String((e as any)?.code || "");
+  return code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EHOSTUNREACH";
+}
+
 function briefAxiosError(e: unknown, label: string, url: string) {
   if (!isAxiosError(e)) {
     return `${label}: ${String((e as any)?.message || e)} (${url})`;
@@ -32,8 +46,9 @@ function briefAxiosError(e: unknown, label: string, url: string) {
 
   const parts = [
     `${label}: request failed`,
+    isTimeoutError(e) ? `(timeout)` : null,
     status ? `HTTP ${status}${statusText ? ` ${statusText}` : ""}` : null,
-    code ? `(${code})` : null,
+    code && !isTimeoutError(e) ? `(${code})` : null,
     backendMsg ? `→ ${backendMsg}` : null,
   ].filter(Boolean);
 
@@ -43,12 +58,13 @@ function briefAxiosError(e: unknown, label: string, url: string) {
 // ---- Timeout helpers ----
 function toMs(v: unknown, fallbackMs: number) {
   const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? n : fallbackMs;
+  return Number.isFinite(n) && n >= 0 ? n : fallbackMs;
 }
 
 function makeClient(): AxiosInstance {
   const client = axios.create({
     baseURL: API_BASE,
+    // Default for normal calls; per-request overrides below.
     timeout: toMs(process.env.INFINITYSNAP_HTTP_TIMEOUT_MS, 60_000),
     headers: {
       "Content-Type": "application/json",
@@ -68,7 +84,6 @@ function makeClient(): AxiosInstance {
 
     h["X-Request-Id"] = rid;
 
-    // IMPORTANT: always send api key if available
     if (API_KEY) {
       h["x-api-key"] = API_KEY;
     }
@@ -81,10 +96,7 @@ function makeClient(): AxiosInstance {
 
 const http = makeClient();
 
-async function getJson<T>(
-  path: string,
-  cfg: AxiosRequestConfig = {}
-): Promise<ApiOk<T>> {
+async function getJson<T>(path: string, cfg: AxiosRequestConfig = {}): Promise<ApiOk<T>> {
   const url = `${API_BASE}${path}`;
   try {
     const res = await http.get(path, cfg);
@@ -104,11 +116,7 @@ async function getJson<T>(
   }
 }
 
-async function postJson<T>(
-  path: string,
-  body: any,
-  cfg: AxiosRequestConfig = {}
-): Promise<ApiOk<T>> {
+async function postJson<T>(path: string, body: any, cfg: AxiosRequestConfig = {}): Promise<ApiOk<T>> {
   const url = `${API_BASE}${path}`;
   try {
     const res = await http.post(path, body, cfg);
@@ -133,12 +141,7 @@ async function postJson<T>(
 // -------------------------
 
 export async function apiSnap(payload: any) {
-  // SNAP execution time is controlled by payload.timeoutMs on backend.
-  // HTTP timeout must be >= that, otherwise axios will abort first.
-  const httpTimeout = toMs(
-    process.env.INFINITYSNAP_SNAP_HTTP_TIMEOUT_MS,
-    20 * 60_000
-  );
+  const httpTimeout = toMs(process.env.INFINITYSNAP_SNAP_HTTP_TIMEOUT_MS, 20 * 60_000);
   return postJson<any>("/snap", payload, { timeout: httpTimeout });
 }
 
@@ -158,24 +161,48 @@ export async function apiApply(runId: string, apply = false) {
 }
 
 export async function apiVerify(runId: string, command?: string) {
-  const timeout = toMs(
-    process.env.INFINITYSNAP_VERIFY_TIMEOUT_MS,
-    20 * 60_000
-  );
+  const timeout = toMs(process.env.INFINITYSNAP_VERIFY_TIMEOUT_MS, 20 * 60_000);
   const body = command ? { runId, command } : { runId };
   return postJson<any>("/verify", body, { timeout });
 }
 
+/**
+ * ✅ FIXED FOR YOUR ISSUE:
+ * apiFix should NOT time out by default, because backend fix can legitimately take minutes.
+ *
+ * - axios timeout: 0 (no timeout) by default
+ * - you can still override via INFINITYSNAP_FIX_HTTP_TIMEOUT_MS if you want
+ *
+ * IMPORTANT:
+ * - Only fall back to local Cline on REAL backend errors / unreachable backend,
+ *   NOT because the request took too long.
+ */
 export async function apiFix(
   runId: string,
   opts?: { command?: string; timeoutMs?: number; dockerImage?: string; task?: string }
 ) {
-  const timeout = toMs(
-    opts?.timeoutMs ?? process.env.INFINITYSNAP_FIX_TIMEOUT_MS,
-    20 * 60_000
-  );
-  const body: any = { runId, ...(opts || {}) };
-  return postJson<any>(`/runs/${encodeURIComponent(runId)}/fix`, body, { timeout });
+  // 0 = no timeout in axios
+  const httpTimeout = toMs(process.env.INFINITYSNAP_FIX_HTTP_TIMEOUT_MS, 0);
+
+  // send timeoutMs only if caller explicitly sets it
+  const body: any = { ...(opts || {}) };
+  if (opts?.timeoutMs != null) body.timeoutMs = opts.timeoutMs;
+
+  const url = `${API_BASE}/runs/${encodeURIComponent(runId)}/fix`;
+
+  try {
+    // we call postJson but with explicit timeout override
+    return await postJson<any>(`/runs/${encodeURIComponent(runId)}/fix`, body, {
+      timeout: httpTimeout,
+    });
+  } catch (e: any) {
+    // If backend is unreachable/refused, that's a valid reason to fall back.
+    if (isAxiosError(e) && (isConnRefused(e) || isTimeoutError(e))) {
+      throw e;
+    }
+    // Otherwise bubble the error: CLI should treat as backend failure (not "timeout")
+    throw e;
+  }
 }
 
 export async function apiResults() {

@@ -1,0 +1,9 @@
+{
+  "name": "infinity-snap-root",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Root package for running tests across subpackages",
+  "scripts": {
+    "test": "npm ci --no-audit --no-fund --prefix samples/infinitysnap-demo && npm test --prefix samples/infinitysnap-demo"
+  }
+}

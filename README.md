@@ -1,291 +1,411 @@
 # ♾️ InfinitySnap
 
-**InfinitySnap turns the Cline CLI into a supervised autonomous coding agent with policy enforcement, verification, rollback, and replay.**
+**InfinitySnap is a supervised autonomous code-fixing system with explicit policy enforcement, verification, rollback, and full replayability.**
 
-InfinitySnap is built for **auditability and restraint**, not blind auto-fixing.
-Every action is logged, every refusal is explained, every fix is verified, and every run is replayable.
+InfinitySnap wraps the Cline CLI inside a **strict, auditable control loop** designed for **correctness, transparency, and restraint** — not blind automation.
 
-> **Correctness > speed. Transparency > magic.**
+> **Correctness > speed**  
+> **Transparency > magic**
 
 ---
 
-## What InfinitySnap does
+## 🔍 What Problem InfinitySnap Solves
 
-InfinitySnap wraps autonomous code execution inside a **strict, judge-safe control loop**.
+Most autonomous “auto-fix” tools:
+- silently modify code
+- apply unverified changes
+- fail without explanation
+- cannot be audited after execution
 
-A single run follows this lifecycle:
+**InfinitySnap is intentionally different.**
 
-1. **Sandbox execution**  
-   Run a command in an isolated copy of the repository.
+It treats autonomy as a **controlled capability**, not a default behavior.
 
-2. **Analysis**  
-   Extract errors, stack traces, and failure signals from stdout/stderr.
+Every fix is:
+- confidence-gated  
+- policy-constrained  
+- verified deterministically  
+- recorded step-by-step  
 
-3. **Confidence gate**  
-   If confidence is below threshold → **refuse** (no code changes).
+Nothing is hidden.
 
-4. **Patch generation / execution**  
-   Generate or apply a fix using a supervised agent (Cline).
+---
+
+## 🧠 Core Philosophy
+
+InfinitySnap is **not a coding assistant**.  
+It is a **supervised autonomous system**.
+
+The agent:
+- cannot act freely
+- cannot bypass policy
+- cannot apply unverified changes
+- cannot hide failures or reasoning
+
+Judges and reviewers can inspect **every artifact**.
+
+---
+
+## 🧬 End-to-End Lifecycle
+
+A single InfinitySnap run follows this lifecycle:
+
+1. **Sandbox Execution**  
+   Run the command (direct or isolated).
+
+2. **Failure Analysis**  
+   Parse stdout/stderr, stack traces, error signals.
+
+3. **Confidence Gate**  
+   If confidence < threshold → **refuse** (no edits).
+
+4. **Supervised Fix (Cline)**  
+   Generate a patch under strict policy constraints.
 
 5. **Verification**  
-   Re-run the command after changes.
+   Re-run the original command.
 
 6. **Rollback (if needed)**  
-   If verification fails or policy blocks changes → repository is restored.
+   Failed verification or policy violation → revert.
 
-7. **Replay**  
-   Every step is recorded as a timeline with artifacts.
+7. **Replay & Artifacts**  
+   Persist logs, diffs, metrics, and a full timeline.
 
 ---
 
-## Why this is different
+## 🏗️ System Architecture
 
-InfinitySnap is **not** a blind “auto-fix” tool.
+```
+Developer / CI / Judge
+        |
+        v
+InfinitySnap CLI (optional)
+        |
+        v
+Backend API (Express)
+        |
+        +-- Sandbox Runner
+        |   - direct mode
+        |   - sandbox copy mode
+        |
+        +-- Analyzer
+        |   - error extraction
+        |   - confidence scoring
+        |
+        +-- Policy Engine
+        |   - command restrictions
+        |   - patch constraints
+        |
+        +-- Cline Executor (supervised)
+        |   - constrained autonomy
+        |
+        +-- Verifier
+        |   - deterministic re-run
+        |
+        +-- Artifact Store
+            - logs
+            - patch / diff
+            - timeline (txt + json)
+```
 
-It demonstrates:
-- Confidence-gated autonomy  
-- Explicit policy enforcement  
-- Deterministic rollback  
-- End-to-end replayability  
+Artifacts are stored **on disk** and served via **explicit HTTP endpoints**.  
+There is no hidden state.
 
-Judges can inspect **everything**:
-- logs
-- diffs
-- patches
-- refusal reasons
+---
+
+## 🧪 Execution Modes
+
+InfinitySnap supports two execution modes:
+
+### Direct Mode (Fast)
+- Runs commands directly in the repository
+- Used for demos and trusted code
+- No repository copy (`copyMs = 0`)
+
+### Sandbox Mode (Safe)
+- Copies repository (with excludes)
+- Executes in a temporary directory
+- Cleanup is timed and logged
+
+The execution mode is **always recorded in the timeline**.
+
+---
+
+## 🚦 Confidence-Gated Autonomy
+
+Before any fix is attempted:
+
+- failure signals are analyzed
+- a confidence score is computed
+- a threshold is enforced
+
+If confidence is below threshold:
+
+```
+status: refused_low_confidence
+```
+
+- No patch is generated  
+- No files are touched  
+
+This restraint is intentional.
+
+---
+
+## 🔐 Policy & Safety Guarantees
+
+InfinitySnap enforces safety through **explicit gates**:
+
+### Command Policy
+- Blocks destructive or unsafe commands
+- Optional allowlist enforcement
+
+### Patch Policy
+- Blocks sensitive paths (`.env`, `.ssh`, credentials)
+- Limits scope of modifications
+
+### Verification Requirement
+- Changes persist only if verification passes
+- Failure triggers automatic rollback
+
+Every decision is:
+- logged
+- timestamped
+- replayable
+
+---
+
+## 🤖 AI Model & Provider
+
+InfinitySnap does **not directly call OpenAI APIs** in its backend logic.  
+Instead, it delegates reasoning to **Cline**, operating in **ACT mode**.
+
+Typical demo configuration (via Cline):
+
+- **Provider:** OpenAI (native)
+- **Model:** `gpt-5-mini`
+- **Mode:** ACT (execution-focused)
+- **Reasoning Effort:** medium
+- **Planning:** bounded
+- **Thinking Budget:** capped
+
+![Authtication Configuration](docs/screenshots/authentication.png)
+
+Model configuration is explicit and inspectable:
+
+```bash
+cline config list --output-format json
+```
+
+InfinitySnap treats the model as a **tool**, not a decision-maker.
+
+---
+
+## 🧾 Artifacts & Replay
+
+Each run produces complete, inspectable artifacts:
+
+- sandbox stdout / stderr
+- analyzer output
+- generated patch
+- git diff
+- verification logs
 - execution timeline
 
-No hidden state. No silent edits.
+### CLI Fix Pipeline
+![CLI Fix Pipeline](docs/screenshots/01-cli-fix-pipeline.png)
+
+
+![Artifact Index](docs/screenshots/03-artifacts-index.png)
+
+### Timeline (Human-readable)
+
+```bash
+GET /api/v1/runs/:id/timeline
+```
+
+Example:
+```
+[0.00s] fix.start → start
+[0.01s] fix.cline → start
+[163.35s] fix.cline → ok
+[163.51s] fix.verify → start
+[164.52s] fix.verify → ok
+[164.52s] fix.complete → verified
+```
+
+### Timeline (Machine-readable)
+
+```bash
+GET /api/v1/runs/:id/timeline.json
+```
+![Timeline Replay](docs/screenshots/02-timeline-replay.png)
+---
+
+## 📸 Screenshots
+
+Place real screenshots under `docs/screenshots/` and reference them here:
+
+```md
+![CLI Fix Pipeline](docs/screenshots/cli-fix-pipeline.png)
+![Timeline Replay](docs/screenshots/timeline-tail.png)
+![Artifact Index](docs/screenshots/artifacts-index.png)
+```
 
 ---
 
-## Architecture (real)
+## 📂 Repository Structure
 
-Developer / CI / Judge
-|
-v
-InfinitySnap CLI (optional)
-|
-v
-Backend API (Express)
-|
-+--> Sandbox Runner (copy repo, run command)
-|
-+--> Analyzer (errors, stack, confidence signals)
-|
-+--> Policy Engine (command / patch / exfil rules)
-|
-+--> Cline Executor (supervised)
-|
-+--> Verifier
-|
-+--> Artifact Store (logs, patch, diff, timeline)
-
-yaml
-Copy code
-
-Artifacts are stored on disk and served through explicit HTTP endpoints.
+```
+infinity-snap/
+├── backend/
+│   ├── src/
+│   │   ├── analyzer.ts
+│   │   ├── sandboxRunner.ts
+│   │   ├── policy.ts
+│   │   ├── routes.ts
+│   │   ├── timeline.ts
+│   │   ├── runStore.ts
+│   │   ├── verifier.ts
+│   │   └── start.ts
+│   ├── .data/
+│   │   ├── runs/
+│   │   ├── logs/
+│   │   ├── diffs/
+│   │   └── artifacts/
+│   └── package.json
+│
+├── cli/
+│   ├── src/
+│   │   ├── apiClient.ts
+│   │   ├── commands/
+│   │   ├── config.ts
+│   │   └── ui/
+│   └── package.json
+│
+├── samples/
+│   └── infinitysnap-demo/
+│       ├── src/
+│       ├── tests/
+│       └── package.json
+│
+├── scripts/
+│   └── cline.sh
+│
+└── README.md
+```
 
 ---
 
-## Quickstart (local)
+## 🚀 Quickstart
 
-### 1️⃣ Start the backend
-
+### Start Backend
 ```bash
 cd backend
 npm install
 npm run dev
-Backend runs at:
+```
 
-arduino
-Copy code
-http://localhost:4000
 Health checks:
+```bash
+curl http://localhost:4000/health
+curl http://localhost:4000/api/v1/health
+```
 
-bash
-Copy code
-curl -s http://localhost:4000/health
-curl -s http://localhost:4000/api/v1/health
-Core API (used in demos)
-1️⃣ Start a run (sandbox + analysis)
-bash
-Copy code
-curl -s -X POST "http://localhost:4000/api/v1/runs/start" \
-  -H "Content-Type: application/json" \
-  -d '{"repoPathOnHost":"./samples/demo-repo","command":"node failing-test.js"}'
-Creates a run containing:
-
-sandbox stdout/stderr
-
-analysis summary
-
-metrics
-
-timeline
-
-2️⃣ List runs
-bash
-Copy code
-curl -s http://localhost:4000/api/v1/runs
-3️⃣ Artifact index (single demo-friendly endpoint)
-bash
-Copy code
-RUN_ID="PUT_RUN_ID_HERE"
-curl -s "http://localhost:4000/api/v1/runs/$RUN_ID/artifacts"
-Returns:
-
-which logs exist
-
-whether patch/diff exist
-
-whether timeline exists
-
-artifact paths
-
-This endpoint exists purely to make demos smoother.
-
-4️⃣ Logs (judge-friendly)
-List available logs:
-
-bash
-Copy code
-curl -s "http://localhost:4000/api/v1/runs/$RUN_ID/logs"
-Combined view:
-
-bash
-Copy code
-curl -s "http://localhost:4000/api/v1/runs/$RUN_ID/logs?view=combined" | head -n 120
-Single log:
-
-bash
-Copy code
-curl -s "http://localhost:4000/api/v1/runs/$RUN_ID/logs/sandbox.stderr"
-5️⃣ Timeline replay
-Human-readable timeline:
-
-bash
-Copy code
-curl -s "http://localhost:4000/api/v1/runs/$RUN_ID/timeline"
-Structured timeline:
-
-bash
-Copy code
-curl -s "http://localhost:4000/api/v1/runs/$RUN_ID/timeline.json"
-Example output:
-
-csharp
-Copy code
-[0.00s] run.init → start
-[0.06s] sandbox.run → start
-[1.04s] sandbox.run → ok
-[1.16s] analysis.complete → ok
-[1.21s] run.complete → ok
-6️⃣ Fix pipeline (supervised autonomy)
-bash
-Copy code
-curl -s -X POST "http://localhost:4000/api/v1/runs/$RUN_ID/fix" \
-  -H "Content-Type: application/json" \
-  -d '{"timeoutMs":180000}'
-Possible outcomes:
-
-verified → fix applied and verification passed
-
-rolled_back → verification failed or policy blocked changes
-
-refused_not_git → repository is not a git repo
-
-refused_low_confidence → confidence below threshold
-
-Refusals are intentional. Judges must see restraint.
-
-Policy & safety guarantees
-InfinitySnap enforces:
-
-Command policy
-
-blocks destructive or unsafe commands
-
-optional allowlist mode
-
-Patch policy
-
-limits number of modified files
-
-blocks sensitive paths (.env, .ssh, credentials, infra)
-
-Confidence gate
-
-below threshold → no execution
-
-Exfiltration detection
-
-suspicious network/token patterns → rollback
-
-All decisions are:
-
-logged
-
-timestamped
-
-replayable
-
-Cold start (transparent by design)
-Initial runs may incur cold start costs (container startup, executor initialization).
-
-InfinitySnap:
-
-measures cold start
-
-records it
-
-shows it in the timeline
-
-Cold start is not hidden or optimized away for demos.
-
-Recommended demo flow (judges)
-Start a failing run
-
-Open combined logs
-
-Trigger /fix
-
-Show:
-
-artifact index
-
-timeline replay
-
-refusal or rollback (if it happens)
-
-Key takeaway:
-
-InfinitySnap never hides what happened.
-
-Project status
-Phase 1–7: ✅ complete
-
-Phase 8 (demo & narrative): ✅ complete
-
-No mock data
-
-No fake UI paths
-
-License
-MIT
-
-markdown
-Copy code
+### Run Demo
+```bash
+cd samples/infinitysnap-demo
+npm test
+infinitysnap fix . --command "npm test"
+```
 
 ---
 
-### ✅ This README is **final**
-- Matches **your real endpoints**
-- Matches **your current behavior**
-- Judge-friendly wording
-- Zero over-claiming
-- No missing features
+## 🔌 API Reference
 
-If you want, next we can:
-- add **screenshots** to this README, or  
-- move to **Phase 9 (final demo script + submission checklist)**
+Base URL:
+```
+http://localhost:4000/api/v1
+```
+
+### List runs
+```bash
+GET /runs
+```
+
+### Run artifacts
+```bash
+GET /runs/:id/artifacts
+```
+
+### Logs
+```bash
+GET /runs/:id/logs
+GET /runs/:id/logs?view=combined
+GET /runs/:id/logs/:name
+```
+
+### Fix pipeline
+```bash
+POST /runs/:id/fix
+```
+
+Possible outcomes:
+- `verified`
+- `rolled_back`
+- `refused_low_confidence`
+- `refused_not_git`
+
+Refusals are intentional and recorded.
+
+---
+
+## ⏱️ Performance Notes
+
+- Snap and Verify are usually fast (command execution time).
+- Fix duration depends on model reasoning and repository scope.
+- Timeline explicitly shows where time is spent (`fix.cline`).
+- InfinitySnap prioritizes **correctness and auditability over raw speed**.
+
+---
+## ⏱️ Timeout Diagnostics & Fix
+
+InfinitySnap is designed to never hang silently.
+If a backend fix takes too long, the CLI intentionally falls back to a local, supervised Cline execution.
+
+This section documents how to diagnose timeout issues and how they were fixed.
+
+## 🔍 Problem Observed
+During early runs, the CLI showed:
+
+- ✖ Calling /runs/:id/fix …
+- ⚠ Backend /runs/:id/fix threw — falling back to local Cline.
+
+Even though the backend fix eventually succeeded when triggered manually.
+
+## 🧪 Diagnostic Step — Prove Where the Timeout Occurs
+
+Run the fix with all FIX-related timeouts disabled:
+```
+export INFINITYSNAP_FIX_HTTP_TIMEOUT_MS=0
+export INFINITYSNAP_FIX_TIMEOUT_MS=0
+infinitysnap fix . --command "npm test"
+```
+
+
+---
+
+## 🎥 Demo Video
+
+▶️ **InfinitySnap — End-to-End Demo (2 minutes)**
+
+[![InfinitySnap Demo Video](docs/screenshots/landing-page.png)](https://www.youtube.com/watch?v=YOUTUBE_VIDEO_ID)
+
+▶️ Click the image to watch the full demo on YouTube.
+
+---
+
+### Dashboard
+![Dashboard](docs/screenshots/landing-page.png)
+![Dashboard](docs/screenshots/snapdashboard.png)
+![Dashboard](docs/screenshots/runid.png)

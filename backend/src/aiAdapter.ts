@@ -1,26 +1,19 @@
 // backend/src/aiAdapter.ts
 /**
- * Real patch generation adapter for InfinitySnap (OpenAI-only)
+ * Real patch generation adapter for InfinitySnap (OpenAI-optional)
  *
- * Goals:
- * - Never hang: hard HTTP timeout (AbortController)
- * - Fail-fast if not configured
- * - Return deterministic JSON-only suggestions
+ * Design principles:
+ * - SILENT when not configured (no warnings, no throws)
+ * - Deterministic, JSON-only output
+ * - Safe-by-default (returns empty suggestions if unavailable)
+ * - Never blocks or degrades the main fix pipeline (Cline)
  *
- * Required env:
- *   OPENAI_API_KEY
- *
- * Optional:
- *   OPENAI_PATCH_MODEL (default: gpt-5-mini)
- *   PATCH_MAX_CONTEXT_FILES (default: 6)
- *   PATCH_MAX_CHARS_PER_FILE (default: 12000)
- *   PATCH_MAX_TOKENS (default: 1800)
- *   PATCH_MAX_CANDIDATES (default: 3)
- *   OPENAI_TIMEOUT_MS (default: 12000)
+ * This adapter is OPTIONAL.
+ * InfinitySnap works fully without OpenAI configured.
  */
 
 export type PatchFile = {
-  path: string;   // repo-relative path
+  path: string;    // repo-relative path
   before: string; // best-effort
   after: string;  // required
 };
@@ -38,16 +31,18 @@ function env(name: string): string {
   return (process.env[name] || "").trim();
 }
 
-function mustEnv(name: string): string {
-  const v = env(name);
-  if (!v) throw new Error(`Missing ${name}. Patch engine is not configured.`);
-  return v;
-}
-
 function intEnv(name: string, def: number): number {
   const n = Number(env(name));
   if (!Number.isFinite(n) || n <= 0) return def;
   return n;
+}
+
+/**
+ * Check if OpenAI patch generation is enabled.
+ * NO logging, NO throwing.
+ */
+function openAiEnabled(): boolean {
+  return !!env("OPENAI_API_KEY");
 }
 
 /** Keep prompt small & deterministic */
@@ -105,13 +100,17 @@ function parseSuggestions(raw: string): PatchSuggestion[] {
     obj = JSON.parse(raw);
   } catch {
     const m = raw.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error("Model did not return valid JSON.");
-    obj = JSON.parse(m[0]);
+    if (!m) return [];
+    try {
+      obj = JSON.parse(m[0]);
+    } catch {
+      return [];
+    }
   }
 
   const suggestions = Array.isArray(obj?.suggestions) ? obj.suggestions : [];
-
   const cleaned: PatchSuggestion[] = [];
+
   for (const s of suggestions) {
     if (!s || !Array.isArray(s.files) || !s.files.length) continue;
 
@@ -129,6 +128,7 @@ function parseSuggestions(raw: string): PatchSuggestion[] {
         after: f.after,
       });
     }
+
     if (!files.length) continue;
 
     cleaned.push({
@@ -152,7 +152,9 @@ function parseSuggestions(raw: string): PatchSuggestion[] {
 }
 
 async function callOpenAI(prompt: { system: string; user: any }): Promise<string> {
-  const apiKey = mustEnv("OPENAI_API_KEY");
+  const apiKey = env("OPENAI_API_KEY");
+  if (!apiKey) return "";
+
   const model = (env("OPENAI_PATCH_MODEL") || "gpt-5-mini").trim();
   const timeoutMs = intEnv("OPENAI_TIMEOUT_MS", 12_000);
 
@@ -179,14 +181,10 @@ async function callOpenAI(prompt: { system: string; user: any }): Promise<string
       }),
     });
 
-    if (!resp.ok) {
-      const t = await resp.text().catch(() => "");
-      throw new Error(`OpenAI error ${resp.status}: ${t.slice(0, 600)}`);
-    }
+    if (!resp.ok) return "";
 
     const data: any = await resp.json();
 
-    // Prefer `output_text`, fallback to scanning output blocks
     const text =
       data?.output_text ||
       (Array.isArray(data?.output)
@@ -198,11 +196,8 @@ async function callOpenAI(prompt: { system: string; user: any }): Promise<string
         : "");
 
     return String(text || "");
-  } catch (e: any) {
-    if (e?.name === "AbortError") {
-      throw new Error(`OpenAI timeout after ${timeoutMs}ms`);
-    }
-    throw e;
+  } catch {
+    return "";
   } finally {
     clearTimeout(t);
   }
@@ -214,10 +209,14 @@ export async function generatePatch(opts: {
   contextFiles?: { path: string; content: string }[];
   topRepos?: string[];
 }): Promise<PatchSuggestion[]> {
+  // 🔇 SILENT NO-OP if OpenAI not configured
+  if (!openAiEnabled()) return [];
+
   const prompt = buildPrompt(opts);
   const raw = await callOpenAI(prompt);
-  const suggestions = parseSuggestions(raw);
+  if (!raw) return [];
 
+  const suggestions = parseSuggestions(raw);
   const max = intEnv("PATCH_MAX_CANDIDATES", 3);
   return suggestions.slice(0, Math.max(1, max));
 }

@@ -33,7 +33,6 @@ export type SandboxOptions = {
   cleanup?: boolean;
   dockerImage?: string;
 
-  // NEW
   mode?: "direct" | "sandbox";
   traceFile?: string;
 };
@@ -44,6 +43,17 @@ function normalizeTimeoutMs(timeoutMs?: number) {
   const n = Number(timeoutMs);
   if (!Number.isFinite(n) || n <= 0) return 60_000;
   return Math.max(1_000, n);
+}
+
+// ✅ FIX: repo root from /repo/backend/src or /repo/backend/dist => /repo
+function repoRoot(): string {
+  return path.resolve(__dirname, "..", "..");
+}
+
+function resolveRepoPathOnHost(p: string): string {
+  const s = String(p || "").trim();
+  if (!s) return s;
+  return path.isAbsolute(s) ? s : path.resolve(repoRoot(), s);
 }
 
 async function copyRepoWithExcludes(srcAbs: string, destAbs: string) {
@@ -63,7 +73,6 @@ async function copyRepoWithExcludes(srcAbs: string, destAbs: string) {
     "backend/.data",
   ];
 
-  // tar-pipe copy is fast on WSL/Linux/macOS
   const exFlags = excludes.map((e) => `--exclude='${e}'`).join(" ");
   const cmd = `bash -lc "cd '${srcAbs.replace(/'/g, "'\\''")}' && tar -cf - ${exFlags} . | (cd '${destAbs.replace(/'/g, "'\\''")}' && tar -xf -)"`;
   await exec(cmd, { maxBuffer: MAX_BUFFER });
@@ -85,7 +94,7 @@ export async function runInSandbox(opts: SandboxOptions): Promise<RunResult> {
     return { ok: false, error: "repoPathOnHost and command are required" };
   }
 
-  const absSrc = path.resolve(repoPathOnHost);
+  const absSrc = resolveRepoPathOnHost(repoPathOnHost);
 
   await trace(traceFile, "sandbox.stat.start", { absSrc });
   try {
@@ -217,7 +226,6 @@ export async function runInSandbox(opts: SandboxOptions): Promise<RunResult> {
     return finish({ ok: true, stdout: stdout?.toString(), stderr: stderr?.toString(), code: 0, command });
   } catch (e: any) {
     const err = e as ExecException & { stdout?: string | Buffer; stderr?: string | Buffer };
-    execMs = execMs || 0;
 
     await trace(traceFile, "sandbox.exec.fail", {
       message: err?.message || String(err),

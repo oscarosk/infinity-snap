@@ -6,6 +6,7 @@ import chalk from "chalk";
 
 import { apiSnap, apiFix, apiTimelineTxt } from "../apiClient";
 import { runClineFix } from "../clineFix";
+import { API_BASE } from "../config";
 
 import {
   printHeader,
@@ -22,12 +23,7 @@ import {
   spacer,
 } from "../ui/render";
 
-import type {
-  SnapResponse,
-  OutputFormat,
-  RunStartSummary,
-  FixResponse,
-} from "../types";
+import type { SnapResponse, OutputFormat, RunStartSummary, FixResponse } from "../types";
 
 function toMs(v: unknown, fallbackMs: number) {
   const n = Number(v);
@@ -113,11 +109,17 @@ async function tryPrintTimeline(runId: string) {
   } catch {}
 }
 
+function apiBaseForPrinting(): string {
+  return String(API_BASE || "http://localhost:4000/api/v1").replace(/\/+$/, "");
+}
+
 function printArtifacts(runId: string) {
   spacer(1);
   console.log(chalk.gray("Artifacts:"));
-  console.log(chalk.gray(`- backend timeline: GET /runs/${runId}/timeline`));
-  console.log(chalk.gray(`- backend run JSON: GET /runs/${runId}`));
+
+  const apiBase = apiBaseForPrinting();
+  console.log(chalk.gray(`- backend timeline: GET ${apiBase}/runs/${runId}/timeline`));
+  console.log(chalk.gray(`- backend run JSON: GET ${apiBase}/runs/${runId}`));
   console.log(chalk.gray(`- local (Phase 5): .infinitysnap/report.json`));
   console.log(chalk.gray(`- local (Phase 5): .infinitysnap/timeline.txt`));
 }
@@ -161,17 +163,8 @@ function endSummaryBox(params: {
   box("InfinitySnap Result", lines, statusTone as any);
 }
 
-// ---- NEW: fetch backend log text (fix.cline.output, etc) ----
 async function fetchBackendLogText(runId: string, logName: string): Promise<string | null> {
-  const backendUrl =
-    process.env.INFINITYSNAP_BACKEND_URL ||
-    process.env.INFINITYSNAP_API ||
-    process.env.INFINITY_BACKEND_URL ||
-    process.env.BACKEND_URL ||
-    process.env.NEXT_PUBLIC_BACKEND_URL ||
-    "http://localhost:4000";
-
-  const apiBase = backendUrl.replace(/\/+$/, "") + "/api/v1";
+  const apiBase = apiBaseForPrinting();
   const url = `${apiBase}/runs/${encodeURIComponent(runId)}/logs?name=${encodeURIComponent(logName)}`;
 
   const key =
@@ -190,44 +183,65 @@ async function fetchBackendLogText(runId: string, logName: string): Promise<stri
   }
 }
 
+/**
+ * Normalize SnapResponse across backend versions:
+ * - New backend: { ok, runId, data: RunRecord }
+ * - Old backend: { ok, runId, runResult, analysis, ... }
+ */
+function normalizeSnap(snapData: any): {
+  runId: string;
+  runResult: any;
+  analysis: any;
+  data: any;
+} {
+  const payload = snapData?.data ?? snapData ?? {};
+  const runId = String(snapData?.runId ?? payload?.runId ?? "").trim();
+  return {
+    runId,
+    runResult: payload?.runResult ?? {},
+    analysis: payload?.analysis ?? {},
+    data: payload,
+  };
+}
+
 async function verifyByResnap(repoPathAbs: string, command: string) {
   pipeline("VERIFY", ["SNAP", "ANALYZE", "FIX", "VERIFY"]);
   section("Verify", "Re-run after local edits (resnap)");
 
   const runTimeoutMs = toMs(process.env.INFINITYSNAP_RUN_TIMEOUT_MS, 180_000);
 
-  const verSpin = (await import("../ui/spinner")).startSpinner("Re-running /snap …");
+  const { startSpinner, stopSpinner } = await import("../ui/spinner");
+  const verSpin = startSpinner("Re-running /snap …");
+
   try {
     const verifySnap: SnapResponse = await apiSnap({
-      repoHostPath: repoPathAbs,
+      repoPathOnHost: repoPathAbs,
       command,
       timeoutMs: runTimeoutMs,
     });
-    verSpin.stop();
 
-    if (!verifySnap.ok) {
-      err(`Verify snap failed: ${verifySnap.error || "Unknown error"}`);
+    if (!(verifySnap as any).ok) {
+      stopSpinner(verSpin, "fail");
+      err(`Verify snap failed: ${(verifySnap as any).error || "Unknown error"}`);
       return { ok: false as const, code: undefined as number | undefined, verifySnap };
     }
 
-    const vr = verifySnap.runResult || {};
+    stopSpinner(verSpin, "stop");
+
+    const n = normalizeSnap(verifySnap);
+    const vr = n.runResult || {};
     kv("Exit", String(vr.code ?? "n/a"), vr.code === 0 ? "ok" : "warn");
     kv("Time", formatMs(vr.durationMs), "muted");
 
     return { ok: true as const, code: vr.code as number | undefined, verifySnap };
   } catch (e: any) {
-    verSpin.stop();
+    stopSpinner(verSpin, "fail");
     err(e?.message || String(e));
     return { ok: false as const, code: undefined as number | undefined, verifySnap: null };
   }
 }
 
-async function fallbackToClineFix(params: {
-  repoPathAbs: string;
-  command: string;
-  runId: string;
-  runResult: any;
-}) {
+async function fallbackToClineFix(params: { repoPathAbs: string; command: string; runId: string; runResult: any }) {
   const { repoPathAbs, command, runId, runResult } = params;
 
   pipeline("FIX", ["SNAP", "ANALYZE", "FIX", "VERIFY"]);
@@ -235,13 +249,15 @@ async function fallbackToClineFix(params: {
 
   const log = buildCombinedLog(runResult);
 
-  const clineSpin = (await import("../ui/spinner")).startSpinner("Cline fixing repo locally …");
+  const { startSpinner, stopSpinner } = await import("../ui/spinner");
+  const clineSpin = startSpinner("Cline fixing repo locally …");
+
   let cr: Awaited<ReturnType<typeof runClineFix>>;
   try {
     cr = await runClineFix({ cwd: repoPathAbs, log, command });
-    clineSpin.stop();
+    stopSpinner(clineSpin, "stop");
   } catch (e: any) {
-    clineSpin.stop();
+    stopSpinner(clineSpin, "fail");
     err("Cline failed to run: " + (e?.message || String(e)));
     info(`runId: ${chalk.magenta(runId)}`);
     return { ok: false as const };
@@ -364,21 +380,23 @@ export async function runStart(opts: {
   kv("RunTimeout", `${Math.round(runTimeoutMs / 1000)}s`, "muted");
   spacer(1);
 
+  const { startSpinner, stopSpinner } = await import("../ui/spinner");
+
   // ---- Step 1: Snap ----
   section("Sandbox Snap", "Run in sandbox + capture logs");
 
-  const snapSpin = (await import("../ui/spinner")).startSpinner("Calling /snap …");
-
+  const snapSpin = startSpinner("Calling /snap …");
   let snapData: SnapResponse;
+
   try {
     snapData = await apiSnap({
-      repoHostPath: repoPathAbs,
+      repoPathOnHost: repoPathAbs,
       command,
       timeoutMs: runTimeoutMs,
     });
-    snapSpin.stop();
+    stopSpinner(snapSpin, "stop");
   } catch (e: any) {
-    snapSpin.stop();
+    stopSpinner(snapSpin, "fail");
     err(e?.message || String(e));
     summary.status = "error";
     summary.error = e?.message || String(e);
@@ -387,23 +405,27 @@ export async function runStart(opts: {
     return;
   }
 
-  if (!snapData.ok) {
-    err(`Snap failed: ${snapData.error || "Unknown error"}`);
+  if (!(snapData as any).ok) {
+    err(`Snap failed: ${(snapData as any).error || "Unknown error"}`);
     summary.status = "snap_failed";
-    summary.error = snapData.error || "snap_failed";
+    summary.error = (snapData as any).error || "snap_failed";
     emitJsonIfNeeded(format, summary);
     restoreConsole();
     return;
   }
 
-  const runId = snapData.runId;
-  const runResult = snapData.runResult || {};
-  const analysis = snapData.analysis || {};
+  const norm = normalizeSnap(snapData);
+
+  const runId = norm.runId;
+  const runResult = norm.runResult || {};
+  const analysis = norm.analysis || {};
 
   summary.runId = runId;
   summary.analysis = analysis;
-  summary.artifacts.endpoints.timelineTxt = `/runs/${runId}/timeline`;
-  summary.artifacts.endpoints.runJson = `/runs/${runId}`;
+
+  const apiBase = apiBaseForPrinting();
+  summary.artifacts.endpoints.timelineTxt = `${apiBase}/runs/${runId}/timeline`;
+  summary.artifacts.endpoints.runJson = `${apiBase}/runs/${runId}`;
 
   kv("runId", String(runId), "info");
   kv("Exit", String(runResult.code ?? "n/a"), runResult.code === 0 ? "ok" : "warn");
@@ -440,13 +462,11 @@ export async function runStart(opts: {
   kv("Stack", String((analysis as any).stackDetected), (analysis as any).stackDetected ? "warn" : "muted");
   kv("Lang", String((analysis as any).languageGuess || "unknown"), "muted");
 
-  const conf =
-    typeof (analysis as any).confidence === "number" ? `${(analysis as any).confidence}%` : "n/a";
+  const conf = typeof (analysis as any).confidence === "number" ? `${(analysis as any).confidence}%` : "n/a";
   kv("Confidence", conf, typeof (analysis as any).confidence === "number" ? "info" : "muted");
 
   spacer(1);
 
-  // snap-only mode ends here
   if (!opts.fix) {
     info("Snap-only mode: stopping after analysis.");
     summary.status = "snap_complete";
@@ -465,7 +485,6 @@ export async function runStart(opts: {
     return;
   }
 
-  // No fix needed
   if (runResult.code === 0 || !(analysis as any).errorDetected) {
     ok("No fix required — command succeeded or no clear error detected.");
     summary.status = "no_fix_needed";
@@ -487,66 +506,16 @@ export async function runStart(opts: {
   // ---- Step 3: Backend Fix (Cline-only) ----
   section("Fix Pipeline", "Cline-only backend fix + verify");
 
+  const fixTimeoutMs = toMs(process.env.INFINITYSNAP_FIX_TIMEOUT_MS, 60_000);
+
+  const fixSpin = startSpinner("Calling /runs/:id/fix …");
+  let fixResp: FixResponse | null = null;
+
   try {
-    const fixSpin = (await import("../ui/spinner")).startSpinner("Calling /runs/:id/fix …");
-    const fixResp: FixResponse = await apiFix(runId, { command, timeoutMs: runTimeoutMs });
-    fixSpin.stop();
-
-    summary.fix = fixResp as any;
-
-    const status = String((fixResp as any)?.status || ((fixResp as any)?.ok ? "verified" : "failed"));
-    summary.status = status;
-
-    if (status === "verified") {
-      ok("Fix verified successfully.");
-    } else if (status === "cline_failed") {
-      warn("Backend Cline failed. Fetching backend Cline output log…");
-
-      const txt = await fetchBackendLogText(runId, "fix.cline.output");
-      if (txt) {
-        spacer(1);
-        console.log(chalk.gray("Backend fix.cline.output (tail):"));
-        console.log(chalk.gray(tailLines(txt, 60)));
-      } else {
-        warn("Could not fetch fix.cline.output (missing key or endpoint unreachable).");
-      }
-
-      // Then fall back to local cline for demo continuity (optional but useful)
-      warn("Falling back to local Cline run to keep moving…");
-      await fallbackToClineFix({ repoPathAbs, command, runId, runResult });
-      restoreConsole();
-      return;
-    } else if (status.startsWith("refused")) {
-      warn(`Refused: ${status}`);
-    } else {
-      warn(`Fix finished with status: ${status}`);
-      // print log tail if present
-      const txt = await fetchBackendLogText(runId, "fix.cline.output");
-      if (txt) {
-        spacer(1);
-        console.log(chalk.gray("Backend fix.cline.output (tail):"));
-        console.log(chalk.gray(tailLines(txt, 40)));
-      }
-    }
-
-    summary.timelineTail = await tryGetTimelineTail(runId);
-    await tryPrintTimeline(runId);
-    printArtifacts(runId);
-
-    emitJsonIfNeeded(format, summary);
-
-    endSummaryBox({
-      runId,
-      repoPathAbs,
-      command,
-      status: summary.status,
-      confidence: typeof (fixResp as any)?.confidence?.score === "number" ? (fixResp as any).confidence.score : null,
-      next: [`infinitysnap view ${runId}`, `infinitysnap open ${runId}`],
-    });
-
-    restoreConsole();
-    return;
+    fixResp = await apiFix(runId, { command, timeoutMs: fixTimeoutMs });
+    stopSpinner(fixSpin, "stop");
   } catch (e: any) {
+    stopSpinner(fixSpin, "fail");
     warn("Backend /runs/:id/fix threw — falling back to local Cline.");
     summary.status = "fallback_cline";
     summary.fallback = { reason: "fix_call_failed", error: e?.message || String(e) };
@@ -556,4 +525,56 @@ export async function runStart(opts: {
     restoreConsole();
     return;
   }
+
+  summary.fix = fixResp as any;
+
+  const status = String((fixResp as any)?.status || ((fixResp as any)?.ok ? "verified" : "failed"));
+  summary.status = status;
+
+  if (status === "verified") {
+    ok("Fix verified successfully.");
+  } else if (status === "cline_failed") {
+    warn("Backend Cline failed. Fetching backend Cline output log…");
+
+    const txt = await fetchBackendLogText(runId, "fix.cline.output");
+    if (txt) {
+      spacer(1);
+      console.log(chalk.gray("Backend fix.cline.output (tail):"));
+      console.log(chalk.gray(tailLines(txt, 60)));
+    } else {
+      warn("Could not fetch fix.cline.output (missing key or endpoint unreachable).");
+    }
+
+    warn("Falling back to local Cline run to keep moving…");
+    await fallbackToClineFix({ repoPathAbs, command, runId, runResult });
+    restoreConsole();
+    return;
+  } else if (status.startsWith("refused")) {
+    warn(`Refused: ${status}`);
+  } else {
+    warn(`Fix finished with status: ${status}`);
+    const txt = await fetchBackendLogText(runId, "fix.cline.output");
+    if (txt) {
+      spacer(1);
+      console.log(chalk.gray("Backend fix.cline.output (tail):"));
+      console.log(chalk.gray(tailLines(txt, 40)));
+    }
+  }
+
+  summary.timelineTail = await tryGetTimelineTail(runId);
+  await tryPrintTimeline(runId);
+  printArtifacts(runId);
+
+  emitJsonIfNeeded(format, summary);
+
+  endSummaryBox({
+    runId,
+    repoPathAbs,
+    command,
+    status: summary.status,
+    confidence: typeof (fixResp as any)?.confidence?.score === "number" ? (fixResp as any).confidence.score : null,
+    next: [`infinitysnap view ${runId}`, `infinitysnap open ${runId}`],
+  });
+
+  restoreConsole();
 }

@@ -16,10 +16,18 @@ import {
 import { clampLog, checkCommand } from "./policy";
 import { trace } from "./logger";
 
+function envMs(name: string, fallback: number) {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
 function normalizeTimeoutMs(timeoutMs?: number) {
   const n = Number(timeoutMs);
-  if (!Number.isFinite(n) || n <= 0) return 60_000;
-  return Math.max(1_000, n);
+  if (!Number.isFinite(n) || n <= 0) return 30_000; // ✅ default faster
+
+  // ✅ Demo-safe cap: never let verify exceed this (default 30s)
+  const cap = envMs("INFINITYSNAP_VERIFY_CAP_MS", 30_000);
+  return Math.max(1_000, Math.min(n, cap));
 }
 
 async function withHardTimeout<T>(
@@ -51,16 +59,17 @@ export async function verifyRun(
 ) {
   const run: any = await readRun(runId);
 
-  const commandToRun =
-    String(opts.command || run.command || run.runResult?.command || "npm test").trim();
+  const commandToRun = String(
+    opts.command || run.command || run.runResult?.command || "npm test"
+  ).trim();
 
   const cmdDecision = checkCommand(commandToRun);
-  if (!cmdDecision.ok) {
-    throw new Error(`${cmdDecision.code}: ${cmdDecision.reason}`);
-  }
+  if (!cmdDecision.ok) throw new Error(`${cmdDecision.code}: ${cmdDecision.reason}`);
 
   const timeoutMs = normalizeTimeoutMs(opts.timeoutMs);
-  const hardMs = Math.max(10_000, timeoutMs + 5_000);
+
+  // hardMs should be slightly > timeoutMs but still bounded
+  const hardMs = Math.max(10_000, timeoutMs + 2_000);
 
   const traceFile = path.join(artifactsDirFor(runId), "verify.trace.log");
 
@@ -75,12 +84,14 @@ export async function verifyRun(
 
   await appendStep(runId, {
     type: "verify.start",
-    message: "Verifying fix (direct runner)",
+    message: "Verifying fix (sandbox runner)",
     ts: Date.now(),
     meta: { command: commandToRun, timeoutMs, dockerImage: opts.dockerImage ?? null },
   });
 
   const t0 = Date.now();
+
+  const controller = new AbortController();
 
   let verifyResult: RunResult;
   try {
@@ -91,9 +102,13 @@ export async function verifyRun(
         timeoutMs,
         cleanup: true,
         dockerImage: opts.dockerImage,
-      }),
+        signal: controller.signal, // ✅ requires sandboxRunner support
+      } as any),
       hardMs,
       async () => {
+        // ✅ actually cancel the sandbox run
+        controller.abort();
+
         await trace(traceFile, "verify.hard_timeout", { runId, hardMs, timeoutMs });
         await appendStep(runId, {
           type: "verify.timeout",
@@ -107,26 +122,20 @@ export async function verifyRun(
     const msg = e?.message || String(e);
     await trace(traceFile, "verify.exception", { runId, msg });
 
-    // Write something useful for debugging
     run.logPaths = run.logPaths || {};
-    run.logPaths["verify.error"] = await writeLog(
-      runId,
-      "verify.error",
-      clampLog(`verify exception: ${msg}`)
-    );
+    run.logPaths["verify.error"] = await writeLog(runId, "verify.error", clampLog(`verify exception: ${msg}`));
 
     run.verify = {
       verifiedAt: new Date().toISOString(),
       result: { ok: false, error: msg, code: null, command: commandToRun },
     };
 
-    run.status = "verified_failed";
+    // ✅ keep statuses simple / consistent
+    run.status = "failed";
     await saveRun(run);
 
     const t1 = Date.now();
-    const metricsRaw = await fs
-      .readFile(metricsFilePath(runId), "utf8")
-      .catch(() => "{}");
+    const metricsRaw = await fs.readFile(metricsFilePath(runId), "utf8").catch(() => "{}");
     const metrics = JSON.parse(metricsRaw || "{}");
     metrics.verifyMs = t1 - t0;
     metrics.lastVerifyAt = new Date().toISOString();
@@ -139,7 +148,7 @@ export async function verifyRun(
       meta: { durationMs: t1 - t0, exitCode: null, error: msg },
     });
 
-    return { runId, verifyResult: run.verify.result as RunResult, logPaths: run.logPaths };
+    return { runId, verifyResult: run.verify.result as RunResult, logPaths: run.logPaths, traceFile };
   }
 
   const t1 = Date.now();
@@ -154,17 +163,13 @@ export async function verifyRun(
   });
 
   run.logPaths = run.logPaths || {};
-
-  const safeStdout = clampLog(verifyResult.stdout || "");
-  const safeStderr = clampLog(verifyResult.stderr || "");
-
-  run.logPaths["verify.stdout"] = await writeLog(runId, "verify.stdout", safeStdout);
-  run.logPaths["verify.stderr"] = await writeLog(runId, "verify.stderr", safeStderr);
+  run.logPaths["verify.stdout"] = await writeLog(runId, "verify.stdout", clampLog(verifyResult.stdout || ""));
+  run.logPaths["verify.stderr"] = await writeLog(runId, "verify.stderr", clampLog(verifyResult.stderr || ""));
 
   run.verify = { verifiedAt: new Date().toISOString(), result: verifyResult };
 
-  // ✅ Status should reflect pass/fail
-  run.status = verifyResult.ok ? "verified_passed" : "verified_failed";
+  // ✅ status aligned with CLI expectations
+  run.status = verifyResult.ok ? "verified" : "failed";
 
   const metricsRaw = await fs.readFile(metricsFilePath(runId), "utf8").catch(() => "{}");
   const metrics = JSON.parse(metricsRaw || "{}");
@@ -178,10 +183,7 @@ export async function verifyRun(
     type: "verify.complete",
     message: verifyResult.ok ? "Verification passed" : "Verification failed",
     ts: Date.now(),
-    meta: {
-      durationMs: t1 - t0,
-      exitCode: verifyResult.code ?? null,
-    },
+    meta: { durationMs: t1 - t0, exitCode: verifyResult.code ?? null },
   });
 
   return { runId, verifyResult, logPaths: run.logPaths, traceFile };
