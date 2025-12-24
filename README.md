@@ -189,7 +189,7 @@ Typical demo configuration (via Cline):
 - **Planning:** bounded
 - **Thinking Budget:** capped
 
-![Authtication Configuration](docs/screenshots/auth.png)
+![Authentication Configuration](docs/screenshots/auth.png)
 
 Model configuration is explicit and inspectable:
 
@@ -212,12 +212,6 @@ Each run produces complete, inspectable artifacts:
 - verification logs
 - execution timeline
 
-### CLI Fix Pipeline
-![CLI Fix Pipeline](docs/screenshots/01-cli-fix-pipeline.png)
-
-
-![Artifact Index](docs/screenshots/03-artifacts-index.png)
-
 ### Timeline (Human-readable)
 
 ```bash
@@ -239,7 +233,7 @@ Example:
 ```bash
 GET /api/v1/runs/:id/timeline.json
 ```
-![Timeline Replay](docs/screenshots/02-timeline-replay.png)
+
 ---
 
 ## 📸 Screenshots
@@ -247,8 +241,8 @@ GET /api/v1/runs/:id/timeline.json
 Place real screenshots under `docs/screenshots/` and reference them here:
 
 ```md
-![CLI Fix Pipeline](docs/screenshots/cli-fix-pipeline.png)
-![Timeline Replay](docs/screenshots/timeline-tail.png)
+![CLI Fix Pipeline](docs/screenshots/01-cli-fix-pipeline.png)
+![Timeline Replay](docs/screenshots/02-timeline-replay.png)
 ![Artifact Index](docs/screenshots/artifacts-index.png)
 ```
 
