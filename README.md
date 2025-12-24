@@ -189,7 +189,7 @@ Typical demo configuration (via Cline):
 - **Planning:** bounded
 - **Thinking Budget:** capped
 
-![Authtication Configuration](docs/screenshots/authentication.png)
+![Authtication Configuration](docs/screenshots/auth.png)
 
 Model configuration is explicit and inspectable:
 
@@ -275,6 +275,13 @@ infinity-snap/
 │   │   └── artifacts/
 │   └── package.json
 │
+├── infinitysnap-dashboard/    # Next.js dashboard UI
+│   ├── src/
+│   │   ├── app/
+│   │   ├── components/
+│   │   └── lib/
+│   └── package.json
+|
 ├── cli/
 │   ├── src/
 │   │   ├── apiClient.ts
@@ -391,21 +398,16 @@ export INFINITYSNAP_FIX_HTTP_TIMEOUT_MS=0
 export INFINITYSNAP_FIX_TIMEOUT_MS=0
 infinitysnap fix . --command "npm test"
 ```
-
-
 ---
 
 ## 🎥 Demo Video
 
 ▶️ **InfinitySnap — End-to-End Demo (2 minutes)**
 
-[![InfinitySnap Demo Video](docs/screenshots/landing-page.png)](https://www.youtube.com/watch?v=YOUTUBE_VIDEO_ID)
-
-▶️ Click the image to watch the full demo on YouTube.
+[![InfinitySnap Demo Video](docs/screenshots/landing-page.png)](https://youtu.be/MHUh92WWApg)
 
 ---
 
 ### Dashboard
-![Dashboard](docs/screenshots/landing-page.png)
 ![Dashboard](docs/screenshots/snapdashboard.png)
 ![Dashboard](docs/screenshots/runid.png)
