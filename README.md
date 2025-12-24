@@ -1,8 +1,8 @@
-# ♾️ InfinitySnap
+# ♾️ InfinitySnap 🫰🏻💜
 
 **InfinitySnap is a supervised autonomous code-fixing system with explicit policy enforcement, verification, rollback, and full replayability.**
 
-InfinitySnap wraps the Cline CLI inside a **strict, auditable control loop** designed for **correctness, transparency, and restraint** — not blind automation.
+InfinitySnap wraps the Cline CLI inside a **strict, auditable control loop** designed for **correctness, transparency, and restraint** — unlike blind automation.
 
 > **Correctness > speed**  
 > **Transparency > magic**
@@ -238,11 +238,21 @@ GET /api/v1/runs/:id/timeline.json
 
 ## 📸 Screenshots
 
-```md
+### CLI Fix Pipeline
+End-to-end execution showing SNAP → ANALYZE → FIX → VERIFY with confidence gating.
+
 ![CLI Fix Pipeline](docs/screenshots/01-cli-fix-pipeline.png)
+
+### Timeline Replay
+Human-readable execution timeline with precise step durations.
+
 ![Timeline Replay](docs/screenshots/02-timeline-replay.png)
+
+### Artifact Index
+All persisted run artifacts (logs, diff, patch, timeline) exposed via API.
+
 ![Artifact Index](docs/screenshots/artifacts-index.png)
-```
+
 
 ---
 
@@ -273,7 +283,7 @@ infinity-snap/
 │   │   ├── components/
 │   │   └── lib/
 │   └── package.json
-|
+│ 
 ├── cli/
 │   ├── src/
 │   │   ├── apiClient.ts
@@ -311,7 +321,34 @@ curl http://localhost:4000/health
 curl http://localhost:4000/api/v1/health
 ```
 
-### Run Demo
+---
+
+## 🖥️ Start Dashboard (Frontend)
+InfinitySnap includes a Next.js dashboard for inspecting runs, timelines, logs, diffs, and artifacts.
+
+### Start Dashboard
+
+```bash
+cd infinitysnap-dashboard
+npm install
+npm run dev
+```
+
+Open in Browser
+```bash
+http://localhost:3000
+```
+The dashboard automatically connects to the backend API and provides:
+
+- run list & status overview
+- timeline replay
+- log, diff, and patch viewers
+- confidence & verification visibility
+
+---
+
+## 🧪 Run Demo
+
 ```bash
 cd samples/infinitysnap-demo
 npm test
@@ -403,3 +440,7 @@ infinitysnap fix . --command "npm test"
 ### Dashboard
 ![Dashboard](docs/screenshots/snapdashboard.png)
 ![Dashboard](docs/screenshots/runid.png)
+
+## 🙏 Acknowledgements
+
+Built using **Cline**, **OpenAI models (via Cline)**, and the **Node.js / TypeScript ecosystem**.
