@@ -251,7 +251,7 @@ Human-readable execution timeline with precise step durations.
 ### Artifact Index
 All persisted run artifacts (logs, diff, patch, timeline) exposed via API.
 
-![Artifact Index](docs/screenshots/artifacts-index.png)
+![Artifact Index](docs/screenshots/03-artifacts-index.png)
 
 
 ---
@@ -377,22 +377,21 @@ GET /runs/:id/artifacts
 ### Logs
 ```bash
 GET /runs/:id/logs
-GET /runs/:id/logs?view=combined
-GET /runs/:id/logs/:name
+GET /runs/:id/logs?name=sandbox.stdout
+GET /runs/:id/logs?name=sandbox.stderr
 ```
 
 ### Fix pipeline
 ```bash
 POST /runs/:id/fix
 ```
+Triggers the supervised fix → verify pipeline for a failed run.
 
 Possible outcomes:
 - `verified`
 - `rolled_back`
 - `refused_low_confidence`
 - `refused_not_git`
-
-Refusals are intentional and recorded.
 
 ---
 
