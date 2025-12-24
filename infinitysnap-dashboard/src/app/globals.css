@@ -1,0 +1,85 @@
+/* src/app/globals.css */
+@import "tailwindcss";
+
+:root {
+  --background: #070a12;
+  --foreground: #eaf0ff;
+
+  --card: rgba(255, 255, 255, 0.06);
+  --card-strong: rgba(255, 255, 255, 0.1);
+  --border: rgba(255, 255, 255, 0.1);
+
+  --muted: rgba(234, 240, 255, 0.7);
+  --muted-2: rgba(234, 240, 255, 0.55);
+
+  --accent: #7c3aed;
+  --accent-2: #ec4899;
+  --accent-3: #22d3ee;
+
+  --shadow: 0 10px 30px -15px rgba(0, 0, 0, 0.55);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
+    Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+/* Make form controls consistently dark */
+button,
+input,
+select,
+textarea {
+  color: inherit;
+}
+
+::selection {
+  background: rgba(124, 58, 237, 0.35);
+}
+
+a {
+  color: inherit;
+}
+
+code,
+pre {
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo,
+    Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+/* -------------------------------------------------------
+   Components (buttons / pills) — consistent contrast
+-------------------------------------------------------- */
+@layer components {
+  .btn-ghost {
+    @apply inline-flex items-center justify-center rounded-full px-4 py-2 text-xs font-semibold
+      border border-white/15 bg-white/10 text-white/90 backdrop-blur
+      shadow-sm transition hover:-translate-y-0.5 hover:bg-white/15 hover:text-white;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-full px-4 py-2 text-xs font-semibold
+      border border-white/15 text-white
+      bg-gradient-to-r from-violet-500/90 via-fuchsia-500/85 to-cyan-400/80
+      shadow-[0_10px_30px_-15px_rgba(0,0,0,0.7)]
+      transition hover:-translate-y-0.5 hover:brightness-110;
+  }
+
+  .btn-pill {
+    @apply inline-flex items-center justify-center rounded-full px-3 py-1.5 text-[11px] font-semibold
+      border border-white/15 bg-white/10 text-white/85 backdrop-blur
+      transition hover:bg-white/15 hover:text-white;
+  }
+}
